@@ -153,28 +153,19 @@ carries an-t35 (`relais counter`), #636 (a first settle answered unknown is
 logged) and #638 (`learn cycle --json`). It is installed here through brew;
 the plugin runs the installed binary, so f33 is live. Filed f46 (a Windows
 wall-clock flake in `timeout_rerun`). The `setup_keeps_one_slot` flake is
-being worked by another session on `fix/flaky-setup-slot-poll`.
-
-- Next: f08 counts explained against unexplained drifts. It is due
-  2026-11-28, and only rows from v0.93.0 on carry a cause.
-- Also ready: f46.
-
-Earlier:
-
-2026-11-25, boundary 4 (v0.87.0 released): the aval launch-failure hint
-branches on where the program came from (f29, #596). v0.87.0 also carries
-#594 (an-t21, `decide` answers fenced through the grant) and #597 (an-t20,
-settings writes through `SharedState`). It is installed here through brew.
-f24 and f25 shipped in v0.84.0, f27 in v0.85.0, f26 in v0.86.0. The plugin
-was reinstalled at 0.86.0 on 2026-11-25 at 22:19, so f24 to f27 are live.
-f30 closed as not needed (the fallback is unreachable).
+being worked by another session on `fix/flaky-setup-slot-poll`. Earlier:
+f29 shipped in v0.87.0, f24 and f25 in v0.84.0, f27 in v0.85.0, and f26 in
+v0.86.0. The plugin was reinstalled at 0.86.0 on 2026-11-25 at 22:19, so f24
+to f27 are live.
 
 - Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31, f32, f33.
 - Next:
+  - Count unexplained home drifts (f08), due 2026-11-28. Only rows from
+    v0.93.0 on carry a cause.
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Name the directory aval cannot enter, since f32 catches only a
     missing one or a file (f34), ready.
-  - Count unexplained home drifts (f08), due 2026-11-28.
+  - Fix or widen the Windows `timeout_rerun` work budget (f46), ready.
   - A pin row's model matches the model its subagent ran (f22), due
     2026-12-01.
   - A week of relays adopts every handoff (f16), due 2026-12-02.

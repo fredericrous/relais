@@ -341,6 +341,7 @@ on.
 - backend approve-with-changes (83k, 103 s; Delta approve 32k, 21 s): input trimming, unreadable-agent line, `holds-until:` fixed; `--git-dir` not followed deliberate: such writes still print as Bash calls.
 - lang:rust approve-with-changes (75k, 118 s; Delta 32k, 19 s): relative `-C`/`cd`, `TargetKind`, cache once, extra compare fixed; per-call timestamp parse, writer-name constants, nested `Option` in `Step`, one clone, tool list twice deliberate: low, no behaviour change.
 - architect approve (57k, 39 s): cache once fixed; `WorkerCall` beside `Cause::Call` deliberate: the port's return shape. unix approve (55k, 49 s): no findings.
+- Closing docs (f33 close, f46): approve-with-changes (63k, 39 s); one handoff in the map and f46's line range fixed.
 - Windows round (after the red CI): unix gates refused as blocking, replaced by the separator fix; all five approve on tree 52e06cd8 (rust's `Cow` instead of a `String` copy deliberate: low).
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix,codex body-sha=a20afd906fa8 -->

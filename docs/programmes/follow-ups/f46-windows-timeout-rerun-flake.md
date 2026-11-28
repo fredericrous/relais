@@ -22,7 +22,7 @@ still draw on work instead of on the total?
 
 ## Look at
 
-- `crates/relais/src/runner/tests/timeout_rerun.rs:140-175`, the test and its
+- `crates/relais/src/runner/tests/timeout_rerun.rs:136-175`, the test and its
   `wall_seconds = Some(6)`.
 - `911f5d343 test(runner): room for work on a slow host (#378)`, the last
   widening.
