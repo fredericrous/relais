@@ -103,6 +103,17 @@ dispatched the run.
 - 2026-11-28 — empty `session_id` falls back to the run id, so a holder is
   never written with an empty session (the crate shows `-` for one and the
   journal would drop the field).
+- 2026-11-28 — the test releases the holder three waits after the move,
+  not on reading place 0 from events.jsonl: that file is not flushed while
+  the wait runs, so it is read only after the grant (found when the
+  mid-wait read never saw place 2).
+- 2026-11-28 — the relais release and install move to the programme driver
+  (its instruction to this ticket agent), so Phase 1 stays open on them and
+  on the live check; this branch carries the code, tests and CHANGELOG.
+- 2026-11-28 — the unattributed prefix is one constant,
+  `verify::UNATTRIBUTED_SESSION_PREFIX`, used by `resolve_session_id` and
+  `slots::holder` (review: lang:rust, backend), declared in `verify` because
+  `coordinator` already depends on it.
 
 ## Verification
 
@@ -129,5 +140,25 @@ dispatched the run.
   characters equal `$CLAUDE_CODE_SESSION_ID` in the dispatching session's
   Bash → `greengate slot promote <id> --reason …` from that session prints a
   move; from another session → refused `own-session`.
+
+### Observed (2026-11-28, before the push)
+
+- Promote test → expected refused `own-session` from `session-other`,
+  `Moved { from: 2, to: 0 }` from `tab`, granted ahead of `a` and `b`, places
+  2s then only 0s, `released` row `"session":"tab"` → observed: passes.
+- Fallback test → expected `run-e` for empty and `unattributed-ppid-7`, `tab`
+  for `tab` → observed: passes.
+- Piloted: `cargo test -p relais --lib verify::heavy` through
+  `greengate slot run --max-wait 3000` → 63 passed, 0 failed; the
+  `host_slots` tests run 5 more times → 5 of 5 pass (10 of 10 on the earlier
+  tree).
+- Live check after install: owed to the driver's release.
+
+## Implementation review
+
+- implementation-review: approve-with-changes; fixed: plan Verification text, observed results, place-order assert, scratch dir; `session-other` naming kept (matches the test). 58k, 52 s.
+- backend: approve-with-changes; fixed: one prefix constant, promote errors recorded in the failure; PR body says why the session change needs no migration. 64k, 81 s.
+- lang:rust: approve-with-changes; fixed: prefix constant (verify side, no new module edge), doc line on `session_id`. 49k, 34 s.
+- tui: approve-with-changes; fixed: CHANGELOG names `$CLAUDE_CODE_SESSION_ID`, drops the stand-in jargon, says where the run id still lives. 43k, 27 s.
 
 <!-- panel: repos=relais,amont reviewers=backend,lang:rust,tui,unix body-sha=1adeb5ace647 -->
