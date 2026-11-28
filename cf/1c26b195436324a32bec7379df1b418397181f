@@ -1,0 +1,20 @@
+greengate-provenance-v1
+commit cf1c26b195436324a32bec7379df1b418397181f
+tree 92225ed7029f1ee8e7482e8c331c3d5493c3f7e2
+canon 6eb8404db0f855ed29790d0c4b3bbc96869fa80a
+patch cc8b550d8f6b426db86cdc2271ae0fee0b4dcb83
+plan docs/plans/2026-11-28-relais-renames-its-aval-identifiers.md b2e1c7784ba6ed92d71aa9046d093445a04d176a24a05b908f1fd2375c4a7cb4
+review reviewed c6f95b47becef331f5987bd3eb8e4919b04e74939368288d5df46168d573be68
+code-review backend reviewed c6f95b47becef331f5987bd3eb8e4919b04e74939368288d5df46168d573be68
+code-review lang:rust reviewed c6f95b47becef331f5987bd3eb8e4919b04e74939368288d5df46168d573be68
+code-review unix reviewed c6f95b47becef331f5987bd3eb8e4919b04e74939368288d5df46168d573be68
+code-review tui reviewed c6f95b47becef331f5987bd3eb8e4919b04e74939368288d5df46168d573be68
+preview not-required
+producer greenbelay 6.18.2
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAAUZ3JlZW5nYXRlLXByb3ZlbmFuY2UAAAAAAAAABnNoYTUxMgAA
+AFMAAAALc3NoLWVkMjU1MTkAAABAGhf20AycGU6mELVfHBW2kNmd9FwcGJHaJCbUacp8gu
+VjF6v9l11DD6zufsIRAqZZB/cRXILpHHOUINt4WolNCQ==
+-----END SSH SIGNATURE-----
