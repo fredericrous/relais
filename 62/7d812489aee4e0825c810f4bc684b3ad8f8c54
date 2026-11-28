@@ -1,0 +1,13 @@
+greensummit-v2
+tree d4bdd3bb5487578a4f8f23936d250317b3d0c1ea
+gates pre-push-branch-protect pre-push-branch-pattern pre-push-secrets pre-push-pull-rebase pre-push-cargo-test pre-push-greenspotter-cli-probe
+platform x86_64-macos
+canon 5684772de0b00bcdd1cb7716144d0be94c77506b
+greengate 5.4.0
+
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg7UOvJ8myo4dhW907VFty7T/bUV
+RFQerK+MWJ4bjChwcAAAALZ3JlZW5zdW1taXQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3No
+LWVkMjU1MTkAAABALDFkVr+pWO7McqFMXztPABjpqx8P1/2f6q3vmQ63837cXcaLrQYzxC
+BNWWVkaGeuBVK5M5BNT8jRXJfd52Y2Cg==
+-----END SSH SIGNATURE-----
