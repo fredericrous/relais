@@ -51,6 +51,19 @@ refuses the bare `held`.
   sits under `## Unreleased`. All Rust auto-merged; clippy `-p relais
   --all-targets -D warnings` clean; all five reviewers approved the rebased
   tree (`bffe16e1…`) as a delta.
+- 2026-11-28 (phase 2): relais writes `held:<lease>` for its own lease and
+  the kept slot's, and passes an accepted inherited marker through
+  unchanged. `HostMarker` reads `GREENHARNESS_HOST_SLOT` once (`var_os`) and
+  judges that same text with `held_marker_in(&dir(), …)`, keeping it only
+  when held; `judge` returns a named `Judged`. Two files beyond the phase's
+  list follow from it: `runner/engine.rs` (the `Judged` destructure) and
+  `docs/SPEC.md` (what the check's environment gets). The lock stays on
+  crate 5.5. Observed on the round-1 tree, pinned 1.94.1, through
+  `greengate slot run`: clippy `--workspace --all-targets -D warnings`
+  clean, `cargo test --workspace --no-fail-fast` 3,339 passed, 0 failed,
+  5 ignored; the real `waits.jsonl` gained 12 rows during the suite, none
+  `"tool":"relais"` and none `marker_*`. After the review fixes: clippy
+  `-p relais` clean, `verify::` 183 and `runner::` 577 passed.
 
 ## Implementation review
 
@@ -59,3 +72,8 @@ refuses the bare `held`.
 - lang:rust: approve (delta); `match` for the journal write; tuple invariant documented. 87k.
 - unix: approve (delta); refusal is also an event. 87k.
 - architect: approve (delta 2); golden kept as generated (deliberate); SPEC's "the check gets the marker" becomes true in phase 2 (deliberate). 114k.
+- phase 2, implementation-review: approve (delta) after approve-with-changes; fixed: `inherited` name, no placeholder marker, extra files logged. 89k.
+- phase 2, backend: approve (delta); fixed: one read of the variable, install order in the CHANGELOG. 84k.
+- phase 2, lang:rust: approve-with-changes (delta); fixed: one read, `Judged`, `Option` marker; deliberate: `absent()`'s empty path, never read (the crate returns `Absent` for no value first). 86k.
+- phase 2, unix: approve (delta); fixed: install order in the CHANGELOG. 78k.
+- phase 2, architect: approve (delta); fixed: one read, private `judged`, no placeholder. 91k.
