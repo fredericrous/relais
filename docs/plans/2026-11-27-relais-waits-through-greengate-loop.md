@@ -172,8 +172,8 @@ relais's `greenharness-slots` requirement rises to the released minor
 - 2026-11-27 — the crate README is left as it is: 8 lines, no API list;
   `docs/host-slots.md` and the rustdoc name `wait_in_line_paced`.
 - 2026-11-27 — `Line(Ceiling)` maps to a new `SlotLineEnd::Ceiling` (relais
-  code review, architect and backend), not to `Stalled`: its event and its
-  journal row both say "ceiling".
+  code review, architect and backend), not to `Stalled`: its journal row and the
+  event's reason say "ceiling"; the event name stays `admission_queue_ended`.
 - 2026-11-27 — the 360 s live pilot is not run. On a host at load ~19 to 494
   with 4 GB free, a real `relais run` behind a 6-minute holder costs a model
   dispatch and a slot for little more than the cancel test now asserts (one
@@ -230,8 +230,8 @@ relais's `greenharness-slots` requirement rises to the released minor
   crates/relais/src/procs.rs` → the net lines removed per file, expected
   about 40 in `heavy.rs` and 25 in `procs.rs`; under 20 net is recorded as
   "one loop, little code saved" and the ticket still closes → `procs.rs` −20,
-  `heavy.rs` +108/−100 before the ceiling variant: about −12 production lines
-  net, plus 89 lines of new tests. One loop, little code saved.
+  `heavy.rs` +115/−100: about −5 production lines net, plus 90 lines of
+  new tests. One loop, little code saved.
 
 ## After release
 

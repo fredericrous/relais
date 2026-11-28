@@ -60,16 +60,17 @@ Done in two pull requests, with the plan
   gone; their two callers (three call sites) read `greenharness_slots::load1`.
 - **Lines removed, measured** (`git diff --numstat origin/main`):
   - `procs.rs`: −20.
-  - `verify/heavy.rs`: +108/−100. The 80-line copy of the loop is gone, but
+  - `verify/heavy.rs`: +115/−100. The 80-line copy of the loop is gone, but
     mapping relais's ends (granted, unusable, stopped, stalled, unreadable,
     ceiling) back to its events and journal rows takes about as many lines.
-  - Production code nets about −12, plus +89 lines of new tests (a cancel
+  - Production code nets about −5, plus +90 lines of new tests (a cancel
     while queued; a lock that fails before joining). That is under the plan's
     20-line bar, so this reads as "one loop, little code saved". The gain is
     the single loop of ADR-0022, not size.
 - **`Line(Ceiling)`**, which relais's `Duration::MAX` ceiling never reaches,
-  maps to a new `SlotLineEnd::Ceiling`, so its event and its journal row both
-  say "ceiling".
+  maps to a new `SlotLineEnd::Ceiling`, so its journal row and its event's reason
+  say "ceiling" (the event name stays `admission_queue_ended`). Follow-up:
+  [f45](../follow-ups/f45-slot-wait-heartbeat-and-prejoin-row.md).
 - **Tests:** `verify::heavy` passes 59 of 59 against the published crate,
   with the existing slot-wait tests unedited. The cancel test asserts one
   heartbeat per pause, and that the cancelled waiter leaves the line.
