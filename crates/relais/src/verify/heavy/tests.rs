@@ -1084,18 +1084,26 @@ fn an_ancestor_that_holds_host_slots_is_not_queued_behind_and_the_fact_is_passed
 /// nothing and is said once (t15 phase 2).
 #[test]
 fn a_host_marker_passes_an_accepted_value_on_unchanged() {
-    use greenharness_slots::held_marker_in;
     let dir = temp_dir("host-marker");
-    let bare = held_marker_in(&dir, Some(std::ffi::OsStr::new("held")));
-    let held = HostMarker::given(bare, Some("held".into()));
-    assert_eq!(held.judge(Some(&*dir)), (Some("held".to_string()), None));
-    let refused = held_marker_in(&dir, Some(std::ffi::OsStr::new("1")));
-    let refused = HostMarker::given(refused, Some("1".into()));
-    let (marker, said) = refused.judge(Some(&*dir));
-    assert_eq!(marker, None, "a refused value is not passed on");
-    assert!(said.is_some_and(|l| l.starts_with("relais: ")));
-    assert_eq!(refused.judge(Some(&*dir)), (None, None), "said once");
-    assert_eq!(HostMarker::absent().judge(Some(&*dir)), (None, None));
+    let judged = |given: Option<&str>| HostMarker::judged(&dir, given.map(std::ffi::OsStr::new));
+    let said_nothing = |marker: Option<&str>| Judged {
+        ancestor_marker: marker.map(str::to_string),
+        said: None,
+    };
+    assert_eq!(
+        judged(Some("held")).judge(Some(&*dir)),
+        said_nothing(Some("held"))
+    );
+    let refused = judged(Some("1"));
+    let first = refused.judge(Some(&*dir));
+    assert_eq!(
+        first.ancestor_marker, None,
+        "a refused value is not passed on"
+    );
+    assert!(first.said.is_some_and(|l| l.starts_with("relais: ")));
+    assert_eq!(refused.judge(Some(&*dir)), said_nothing(None), "said once");
+    assert_eq!(judged(None).judge(Some(&*dir)), said_nothing(None));
+    assert_eq!(HostMarker::absent().judge(Some(&*dir)), said_nothing(None));
 }
 
 /// A held marker is read by the slots crate's one reader (amont t15): a

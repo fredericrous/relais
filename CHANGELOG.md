@@ -13,7 +13,9 @@ slot lease a command runs under, instead of the bare `held` (amont
 host-slot-admission t15, phase 2): a setup's later steps carry the kept
 slot's lease, and under an ancestor's slot the inherited marker passes to the
 check unchanged. A run under `[resources] shared_host_slots` holds its lease
-in that directory, so a greengate child reading the default one queues there.
+in that directory, so a greengate child reading the default one queues there. Install greengate 5.4.0 or later first:
+an older greengate child refuses `held:<lease>` and queues behind its own
+parent.
 
 ## v0.95.0
 

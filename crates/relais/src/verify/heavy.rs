@@ -93,38 +93,62 @@ pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 /// runs it hosts, gets the same answer (amont host-slot-admission t15).
 pub struct HostMarker {
     marker: greenharness_slots::Marker,
-    /// The `GREENHARNESS_HOST_SLOT` value the marker was judged from.
-    value: Option<String>,
+    /// The `GREENHARNESS_HOST_SLOT` text an accepted marker was judged from,
+    /// passed to the checks unchanged; `None` unless the marker is held.
+    inherited: Option<String>,
     log: greenharness_slots::MarkerLog,
 }
 
+/// What [`HostMarker::judge`] found for one admission.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Judged {
+    /// The marker an ancestor holds the slots under, for the checks; `None`
+    /// when no ancestor holds them, and this run queues.
+    pub ancestor_marker: Option<String>,
+    /// The refusal line to say, the first time only.
+    pub said: Option<String>,
+}
+
 impl HostMarker {
-    /// This process's `GREENHARNESS_HOST_SLOT`, judged now.
+    /// This process's `GREENHARNESS_HOST_SLOT`, read once and judged by the
+    /// slots crate's one reader against its own directory.
     pub fn read() -> HostMarker {
-        let value = std::env::var(HOST_SLOT_ENV).ok();
-        HostMarker::given(greenharness_slots::held_marker(), value)
+        let given = std::env::var_os(HOST_SLOT_ENV);
+        HostMarker::judged(&greenharness_slots::dir(), given.as_deref())
     }
 
-    /// A marker already judged from `value`, with a fresh log.
-    pub fn given(marker: greenharness_slots::Marker, value: Option<String>) -> HostMarker {
+    /// `given` judged against the slot directory `dir`, with a fresh log:
+    /// the one place the text and its verdict are paired.
+    fn judged(dir: &Path, given: Option<&std::ffi::OsStr>) -> HostMarker {
+        let marker = greenharness_slots::held_marker_in(dir, given);
+        let inherited = marker
+            .is_held()
+            .then(|| given.map(|g| g.to_string_lossy().into_owned()))
+            .flatten();
         HostMarker {
             marker,
-            value,
+            inherited,
             log: greenharness_slots::MarkerLog::new(),
         }
     }
 
     /// No marker: nothing held above this run.
     pub fn absent() -> HostMarker {
-        HostMarker::given(greenharness_slots::Marker::Absent, None)
+        HostMarker::judged(Path::new(""), None)
     }
 
-    /// [`ancestor_holds_slots`] for this marker and its log: the marker an
-    /// ancestor holds the slots under, passed to the checks unchanged (t15
-    /// phase 2), or `None`; and the line to say, once.
-    pub fn judge(&self, queues: Option<&Path>) -> (Option<String>, Option<String>) {
+    /// [`ancestor_holds_slots`] for this marker and its log, with the
+    /// inherited marker the checks get unchanged (t15 phase 2).
+    pub fn judge(&self, queues: Option<&Path>) -> Judged {
         let (held, said) = ancestor_holds_slots(&self.marker, queues, &self.log);
-        (held.then(|| self.value.clone()).flatten(), said)
+        debug_assert!(
+            !held || self.inherited.is_some(),
+            "a held marker keeps its text"
+        );
+        Judged {
+            ancestor_marker: held.then(|| self.inherited.clone()).flatten(),
+            said,
+        }
     }
 }
 
@@ -753,7 +777,7 @@ impl<'a> HeavyAdmission<'a> {
         let asked = usize::try_from(ask.weight).unwrap_or(usize::MAX);
         // Under the lock: read, relabel, or take out the lease of another
         // weight. Everything said is said after the lock is let go.
-        let (weight, marker, renamed, other) = {
+        let (weight, kept_marker, renamed, other) = {
             let mut state = self.setup_slot.state();
             let Kept::Open {
                 lease: Some(lease),
@@ -771,12 +795,12 @@ impl<'a> HeavyAdmission<'a> {
                     }
                     _ => Ok(()),
                 };
-                (weight, lease.marker(), renamed, None)
+                (weight, Some(lease.marker()), renamed, None)
             } else {
                 let Kept::Open { lease, .. } = &mut *state else {
                     unreachable!("matched as open above");
                 };
-                (weight, String::new(), Ok(()), lease.take())
+                (weight, None, Ok(()), lease.take())
             }
         };
         if let Some(other) = other {
@@ -807,7 +831,7 @@ impl<'a> HeavyAdmission<'a> {
                 ask.label
             ),
         });
-        Some((weight, marker))
+        kept_marker.map(|marker| (weight, marker))
     }
 
     /// Keep `held` for the setup when one is open: the weight it holds.
