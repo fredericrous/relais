@@ -1,14 +1,14 @@
-//! Guidance: the advisory half of what aval tells a worker (SPEC §7).
+//! Guidance: the advisory half of what greentopo tells a worker (SPEC §7).
 //!
 //! Binding decisions (contract keys and mappings) live in the manifest's
 //! `constraints` and can block a run. Guidance never does: the constraint
-//! index, the full constraint statements and aval's relevance ranking are
+//! index, the full constraint statements and greentopo's relevance ranking are
 //! fetched through the `DecisionResolver` port, kept here as typed values,
 //! and every failure is a `GuidanceGap` the run continues past. Guidance
 //! has its own byte budget and never counts toward a sizing problem.
 //!
 //! Everything in this module is a pure function over values, except
-//! `run_aval`, the one bounded spawn.
+//! `run_greentopo`, the one bounded spawn.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,10 +21,10 @@ use std::time::Duration;
 /// first, then the index.
 pub const GUIDANCE_BUDGET_BYTES: usize = 16 * 1024;
 
-/// How much of the objective goes into aval's argv.
+/// How much of the objective goes into greentopo's argv.
 pub const OBJECTIVE_ARGV_BYTES: usize = 2048;
 
-/// How many ranked entries aval is asked for.
+/// How many ranked entries greentopo is asked for.
 pub const RELEVANT_TOP: usize = 20;
 
 /// Which part of the guidance a gap is about.
@@ -47,7 +47,7 @@ pub enum GuidanceSource {
     /// `greenspotter candidates`: the lines the reviewer is asked to rule on.
     Candidates,
     /// Decision keys the task depends on that were not checked because
-    /// aval is not installed.
+    /// greentopo is not installed.
     DecisionKeys,
 }
 
@@ -65,9 +65,9 @@ pub struct GuidanceGap {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapCause {
-    /// aval ran to this non-zero exit status.
+    /// greentopo ran to this non-zero exit status.
     Exited(i32),
-    /// aval timed out, was cancelled or died on a signal.
+    /// greentopo timed out, was cancelled or died on a signal.
     #[default]
     NoAnswer,
     /// The `greentopo` binary could not be launched at all: asking it a second
@@ -75,15 +75,22 @@ pub enum GapCause {
     NotLaunched,
     /// The guidance was dropped to fit its byte budget.
     OverBudget { measured: usize, budget: usize },
-    /// aval answered, and the answer was not the expected shape.
+    /// greentopo answered, and the answer was not the expected shape.
     Unparseable,
-    /// aval answered, and the decisions pack it read predates `governs`.
+    /// greentopo answered, and the decisions pack it read predates `governs`.
     StalePack,
-    /// aval answered, and it is too old for `--full`/`governs`.
-    AvalTooOld,
+    /// greentopo answered, and it is too old for `--full`/`governs`.
+    GreentopoTooOld,
     /// The full text of a code rule is not in memory, so it cannot be carried;
     /// this is missing text, never a timeout.
     TextUnavailable,
+    /// A bare-string cause this relais does not know, read from a manifest
+    /// written by another version, such as the old program's name for
+    /// `GreentopoTooOld` before the rename (a cause that carries data still
+    /// fails to parse). Nothing here builds it: it only keeps such a manifest
+    /// readable.
+    #[serde(other)]
+    Unknown,
 }
 
 impl GuidanceGap {
@@ -95,7 +102,7 @@ impl GuidanceGap {
         }
     }
 
-    /// Asking aval again would fail the same way.
+    /// Asking greentopo again would fail the same way.
     pub fn is_not_launched(&self) -> bool {
         self.cause == GapCause::NotLaunched
     }
@@ -139,7 +146,7 @@ pub fn gap_line(gaps: &[GuidanceGap]) -> Option<String> {
     Some(format!("guidance: {}", phrases.join("; ")))
 }
 
-/// One rule as aval states it.
+/// One rule as greentopo states it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleRef {
     pub id: String,
@@ -148,7 +155,7 @@ pub struct RuleRef {
     pub statement: String,
 }
 
-/// What `greentopo rules` left out of the list, as aval counts it.
+/// What `greentopo rules` left out of the list, as greentopo counts it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Omitted {
     #[serde(default)]
@@ -254,13 +261,13 @@ pub struct Rules {
     pub omitted: Omitted,
     /// The ones that declare `governs: code`, with their full text.
     pub code_rules: Vec<CodeRule>,
-    /// Gaps of a fetch that still produced rules (an old aval, a stale
+    /// Gaps of a fetch that still produced rules (an old greentopo, a stale
     /// pack), each naming its fix.
     pub notes: Vec<GuidanceGap>,
 }
 
-/// A ranked key's state as aval reports it; anything but the two known
-/// states is kept as aval wrote it.
+/// A ranked key's state as greentopo reports it; anything but the two known
+/// states is kept as greentopo wrote it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum RankState {
@@ -289,7 +296,7 @@ impl From<RankState> for String {
     }
 }
 
-/// One decision key aval ranked, with its state as aval reported it. A
+/// One decision key greentopo ranked, with its state as greentopo reported it. A
 /// ranking is a suggestion: a key that is not active is recorded and
 /// never blocks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,7 +319,7 @@ pub struct Relevant {
     pub rules: Vec<RuleRef>,
 }
 
-/// What a run asks aval to rank against.
+/// What a run asks greentopo to rank against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelevantQuery {
     pub paths: Vec<String>,
@@ -324,8 +331,8 @@ pub struct RelevantQuery {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Guidance {
     #[serde(default)]
-    pub aval_version: Option<String>,
-    /// The ids the worker's constraint index carries; empty when aval
+    pub greentopo_version: Option<String>,
+    /// The ids the worker's constraint index carries; empty when greentopo
     /// gave none or the budget dropped it.
     #[serde(default)]
     pub index: Vec<String>,
@@ -334,7 +341,7 @@ pub struct Guidance {
     #[serde(default)]
     pub code_rules: Vec<CodeRule>,
     /// Every active constraint rule with its statement: what the reviewer
-    /// is shown in place of the index, since it cannot run aval.
+    /// is shown in place of the index, since it cannot run greentopo.
     #[serde(default)]
     pub rules: Vec<RuleRef>,
     #[serde(default)]
@@ -347,7 +354,7 @@ pub struct Guidance {
     #[serde(default)]
     pub gaps: Vec<GuidanceGap>,
     /// The directory name of the repository root this run is for, which is
-    /// the name aval's corpus knows the repository by; the worker passes it
+    /// the name greentopo's corpus knows the repository by; the worker passes it
     /// as `repo` to the `greentopo_rule` tool. `None` when unknown.
     #[serde(default)]
     pub repo_name: Option<String>,
@@ -401,7 +408,7 @@ pub fn rendered_bytes(lines: &[String]) -> usize {
 }
 
 /// Keep the guidance inside `budget`. The ranking is cut proportionally
-/// from the tail of each list (keys and rules each in aval's order): while
+/// from the tail of each list (keys and rules each in greentopo's order): while
 /// over budget, the tail entry of the list whose kept rendered bytes are the
 /// larger fraction of that list's original rendered bytes is dropped, rules
 /// first on a tie. Rules that are code rules (`guidance.code_rules`) are
@@ -574,7 +581,7 @@ struct RawRules {
 
 /// Parse `greentopo rules --level constraint --full --json` (aval 1.10.0), or
 /// the same without `--full` (1.9.0, no `governs`, no `body`): the active
-/// rules, the ones that govern code, and what aval omitted. Any other
+/// rules, the ones that govern code, and what greentopo omitted. Any other
 /// shape is a gap.
 pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
     let raw: RawRules = serde_json::from_str(stdout.trim()).map_err(|e| {
@@ -605,15 +612,15 @@ pub fn parse_rules_output(stdout: &str) -> Result<Rules, GuidanceGap> {
 }
 
 /// One spawn of `greentopo` with the given argv.
-pub(super) type AvalRun<'a> = &'a dyn Fn(&[String]) -> Result<String, GuidanceGap>;
+pub(super) type GreentopoRun<'a> = &'a dyn Fn(&[String]) -> Result<String, GuidanceGap>;
 
 /// [`fetch_rules`] in the repository, and when the repository has no
-/// decisions corpus of its own (aval exit 3) the same fetch in the fleet
+/// decisions corpus of its own (greentopo exit 3) the same fetch in the fleet
 /// decisions directory, when one is known. The fleet's answer replaces the
 /// gap only when it carries rules; otherwise the repository's own gap stays.
 pub fn fetch_rules_or_fleet(
-    repository: AvalRun<'_>,
-    fleet: Option<AvalRun<'_>>,
+    repository: GreentopoRun<'_>,
+    fleet: Option<GreentopoRun<'_>>,
 ) -> Result<Rules, GuidanceGap> {
     match fetch_rules(repository) {
         Err(gap) if gap.cause == GapCause::Exited(3) => match fleet.map(fetch_rules) {
@@ -624,7 +631,7 @@ pub fn fetch_rules_or_fleet(
     }
 }
 
-/// Fetch the constraints with `run` (one spawn of the given argv). An aval
+/// Fetch the constraints with `run` (one spawn of the given argv). A greentopo
 /// that exits 2 on the new argv is too old for it: the previous argv is
 /// tried, and the gap naming the fix is kept only when that succeeds. Rules
 /// without any `governs: code` mean a stale decisions pack. Other failures
@@ -632,16 +639,16 @@ pub fn fetch_rules_or_fleet(
 pub fn fetch_rules(
     run: &dyn Fn(&[String]) -> Result<String, GuidanceGap>,
 ) -> Result<Rules, GuidanceGap> {
-    let (stdout, old_aval) = match run(&rules_args()) {
+    let (stdout, old_greentopo) = match run(&rules_args()) {
         Ok(stdout) => (stdout, false),
         Err(gap) if gap.cause == GapCause::Exited(2) => (run(&legacy_rules_args())?, true),
         Err(gap) => return Err(gap),
     };
     let mut rules = parse_rules_output(&stdout)?;
-    if old_aval {
+    if old_greentopo {
         rules.notes.push(GuidanceGap::new(
             GuidanceSource::CodeRules,
-            GapCause::AvalTooOld,
+            GapCause::GreentopoTooOld,
             "greentopo is older than 1.10.0 (no --full/governs; exit 2): code rules are not carried; upgrade it, e.g. `brew upgrade greentopo` or greentopo's install/install.sh",
         ));
     } else if !rules.rules.is_empty() && rules.code_rules.is_empty() {
@@ -722,7 +729,7 @@ pub fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
 }
 
 /// A write-scope glob or read hint reduced to the literal directory
-/// prefix aval can match: `a/b/**/*.rs` is `a/b`. A glob character in the
+/// prefix greentopo can match: `a/b/**/*.rs` is `a/b`. A glob character in the
 /// first segment leaves nothing to match (`**`, `{a,b}/**`, `*/x`); a path
 /// without one is kept as it is.
 pub fn glob_to_path(glob: &str) -> Option<String> {
@@ -784,7 +791,7 @@ pub fn decisions_args(paths: &[String]) -> Vec<String> {
     args
 }
 
-/// The ranked keys aval returns for `paths`, through `run` (one bounded
+/// The ranked keys greentopo returns for `paths`, through `run` (one bounded
 /// spawn of the given argv). A failure is a gap of `Decisions`.
 pub fn fetch_decisions(
     run: &dyn Fn(&[String]) -> Result<String, GuidanceGap>,
@@ -807,7 +814,7 @@ pub fn rules_args() -> Vec<String> {
         .collect()
 }
 
-/// The previous argv, for an aval that does not know `--full`.
+/// The previous argv, for a greentopo that does not know `--full`.
 pub fn legacy_rules_args() -> Vec<String> {
     ["rules", "--level", "constraint", "--json"]
         .into_iter()
@@ -817,7 +824,7 @@ pub fn legacy_rules_args() -> Vec<String> {
 
 /// Spawn `program args…` in `dir`, bounded and cancellable. Success is
 /// stdout; every other end is a gap of `source`.
-pub fn run_aval(
+pub fn run_greentopo(
     program: &str,
     args: &[String],
     dir: &Path,
@@ -828,7 +835,7 @@ pub fn run_aval(
     run_tool("greentopo", program, args, dir, source, timeout, cancel)
 }
 
-/// [`run_aval`] for any guidance tool: `tool` is the name its gaps carry.
+/// [`run_greentopo`] for any guidance tool: `tool` is the name its gaps carry.
 pub fn run_tool(
     tool: &str,
     program: &str,
@@ -998,12 +1005,16 @@ mod tests {
         assert!(parsed.code_rules.is_empty());
     }
 
-    /// A fake aval: `script` is run by `sh` with the argv after `aval`.
-    fn fake_aval(script: &'static str) -> impl Fn(&[String]) -> Result<String, GuidanceGap> {
+    /// A fake greentopo: `script` is run by `sh` with the argv after `greentopo`.
+    fn fake_greentopo(script: &'static str) -> impl Fn(&[String]) -> Result<String, GuidanceGap> {
         move |args: &[String]| {
-            let mut argv = vec!["-c".to_string(), script.to_string(), "aval".to_string()];
+            let mut argv = vec![
+                "-c".to_string(),
+                script.to_string(),
+                "greentopo".to_string(),
+            ];
             argv.extend(args.iter().cloned());
-            run_aval(
+            run_greentopo(
                 "sh",
                 &argv,
                 Path::new("."),
@@ -1027,10 +1038,10 @@ mod tests {
     }
 
     #[test]
-    fn an_old_aval_is_retried_with_the_previous_argv_and_names_the_fix() {
+    fn an_old_greentopo_is_retried_with_the_previous_argv_and_names_the_fix() {
         let script = r#"for a in "$@"; do [ "$a" = --full ] && exit 2; done
 printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","statement":"s"}]}'"#;
-        let rules = fetch_rules(&fake_aval(script)).expect("retry succeeds");
+        let rules = fetch_rules(&fake_greentopo(script)).expect("retry succeeds");
         assert_eq!(rules.rules.len(), 1);
         assert!(rules.code_rules.is_empty());
         assert_eq!(rules.notes.len(), 1);
@@ -1043,9 +1054,9 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
 
     #[test]
     fn a_failed_retry_is_the_retrys_gap_and_no_note() {
-        let gap = fetch_rules(&fake_aval("exit 2")).expect_err("both fail");
+        let gap = fetch_rules(&fake_greentopo("exit 2")).expect_err("both fail");
         assert_eq!(gap.cause, GapCause::Exited(2));
-        let gap = fetch_rules(&fake_aval(
+        let gap = fetch_rules(&fake_greentopo(
             r#"for a in "$@"; do [ "$a" = --full ] && exit 2; done; exit 3"#,
         ))
         .expect_err("retry fails");
@@ -1055,7 +1066,7 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
     #[test]
     fn rules_without_a_code_rule_name_the_stale_pack_and_stay_in_the_index() {
         let script = r#"printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","statement":"s","governs":null,"body":""}]}'"#;
-        let rules = fetch_rules(&fake_aval(script)).expect("parses");
+        let rules = fetch_rules(&fake_greentopo(script)).expect("parses");
         assert_eq!(rules.rules.len(), 1);
         assert_eq!(rules.notes.len(), 1);
         assert_eq!(rules.notes[0].cause, GapCause::StalePack);
@@ -1072,7 +1083,7 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
             ("exit 1", GapCause::Exited(1)),
             ("exit 3", GapCause::Exited(3)),
         ] {
-            let gap = fetch_rules(&fake_aval(script)).expect_err(script);
+            let gap = fetch_rules(&fake_greentopo(script)).expect_err(script);
             assert_eq!(gap.cause, cause);
         }
         let slow = |_: &[String]| sh("sleep 5", GuidanceSource::Index, Duration::from_millis(100));
@@ -1084,7 +1095,7 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
 
     #[test]
     fn a_repository_without_a_corpus_takes_the_fleet_code_rules() {
-        let none = fake_aval("exit 3");
+        let none = fake_greentopo("exit 3");
         let fleet = |_: &[String]| Ok(FULL_RULES_JSON.to_string());
         let rules = fetch_rules_or_fleet(&none, Some(&fleet)).expect("the fleet's rules");
         assert_eq!(rules.code_rules.len(), 2);
@@ -1093,7 +1104,7 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
         let empty = |_: &[String]| Ok(r#"{"rules":[]}"#.to_string());
         let gap = fetch_rules_or_fleet(&none, Some(&empty)).expect_err("the fleet has none");
         assert_eq!(gap.cause, GapCause::Exited(3));
-        let other = fake_aval("exit 1");
+        let other = fake_greentopo("exit 1");
         let gap = fetch_rules_or_fleet(&other, Some(&fleet)).expect_err("only exit 3 falls back");
         assert_eq!(gap.cause, GapCause::Exited(1));
     }
@@ -1103,7 +1114,7 @@ printf '%s' '{"rules":[{"id":"errors.typed-values","level":"constraint","stateme
         let script = r#"cat <<'EOF'
 {"rules":[{"id":"a.b","level":"constraint","statement":"s","governs":"code","body":"b"}]}
 EOF"#;
-        let rules = fetch_rules(&fake_aval(script)).expect("parses");
+        let rules = fetch_rules(&fake_greentopo(script)).expect("parses");
         assert!(rules.notes.is_empty());
         assert_eq!(rules.code_rules.len(), 1);
     }
@@ -1160,7 +1171,7 @@ EOF"#;
                 "functions: functions.no-flag-arguments"
             ]
         );
-        // Every id token is exactly an id aval returned.
+        // Every id token is exactly an id greentopo returned.
         let known: Vec<&str> = rules.iter().map(|rule| rule.id.as_str()).collect();
         for line in &lines {
             let (_, ids) = line.split_once(": ").expect("prefix: ids");
@@ -1219,16 +1230,16 @@ EOF"#;
 
     #[test]
     fn decisions_come_from_a_bounded_spawn_and_a_failure_is_a_decisions_gap() {
-        let ok = fake_aval(
+        let ok = fake_greentopo(
             r#"printf '%s' '{"keys":[{"key":"k.k","state":"active","adr":"ADR-1","choice":"c"}],"rules":[]}'"#,
         );
         let keys = fetch_decisions(&ok, &["a".to_string()]).expect("keys");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, "k.k");
-        let failing = fake_aval("exit 3");
+        let failing = fake_greentopo("exit 3");
         let gap = fetch_decisions(&failing, &["a".to_string()]).expect_err("gap");
         assert_eq!(gap.cause, GapCause::Exited(3));
-        let garbled = fake_aval("printf '%s' nope");
+        let garbled = fake_greentopo("printf '%s' nope");
         let gap = fetch_decisions(&garbled, &["a".to_string()]).expect_err("gap");
         assert_eq!(gap.source, GuidanceSource::Decisions);
     }
@@ -1267,7 +1278,7 @@ EOF"#;
     }
 
     fn sh(script: &str, source: GuidanceSource, timeout: Duration) -> Result<String, GuidanceGap> {
-        run_aval(
+        run_greentopo(
             "sh",
             &["-c".to_string(), script.to_string()],
             Path::new("."),
@@ -1300,7 +1311,7 @@ EOF"#;
         assert_eq!(slow.cause, GapCause::NoAnswer);
         assert!(slow.detail.contains("timed out"), "{}", slow.detail);
 
-        let missing = run_aval(
+        let missing = run_greentopo(
             "relais-no-such-binary-4f3a",
             &[],
             Path::new("."),
@@ -1323,7 +1334,7 @@ EOF"#;
                 std::thread::sleep(Duration::from_millis(200));
                 cancel.store(true, Ordering::SeqCst);
             });
-            run_aval(
+            run_greentopo(
                 "sleep",
                 &["30".to_string()],
                 Path::new("."),
@@ -1344,7 +1355,7 @@ EOF"#;
     }
 
     #[test]
-    fn an_unknown_rank_state_is_kept_as_aval_wrote_it() {
+    fn an_unknown_rank_state_is_kept_as_greentopo_wrote_it() {
         assert_eq!(
             RankState::from("retired".to_string()),
             RankState::Other("retired".into())

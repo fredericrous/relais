@@ -701,7 +701,7 @@ fn has_conflict_marker(path: &Path) -> Result<bool> {
 /// Protected repository configuration (SPEC §8): changes here are rejected
 /// unless the contract explicitly includes them in its write scope. The
 /// policy file itself, relais's own scratch, the check gate's trust
-/// declaration, Claude Code project settings, the aval registry, CI on
+/// declaration, Claude Code project settings, the greentopo registry, CI on
 /// every forge relais runs against, the project instructions a
 /// reviewer's session loads, and the ignore file (an unprotected
 /// `.gitignore` lets a worker hide files from the diff, the snapshot and

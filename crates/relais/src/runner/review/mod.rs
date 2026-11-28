@@ -557,7 +557,7 @@ pub(in crate::runner) fn candidate_rules(
     }
 }
 
-/// What the reviewer reads of aval, and the rules it got as index lines,
+/// What the reviewer reads of greentopo, and the rules it got as index lines,
 /// which relais journals.
 pub(in crate::runner) struct ReviewerGuidance {
     pub(in crate::runner) text: String,
@@ -595,7 +595,7 @@ fn reviewer_fetch_instruction(guidance: &Guidance) -> String {
     )
 }
 
-/// What the reviewer reads of aval (ADR-0066): in full, the code rules with
+/// What the reviewer reads of greentopo (ADR-0066): in full, the code rules with
 /// a judge part and the tool-checked ones a candidate of this diff names;
 /// one line each for the other tool-checked code rules and for the process
 /// rules, with how to read one through `greentopo_rule`; then the relevant block
@@ -715,7 +715,7 @@ pub(in crate::runner) fn reviewer_guidance(
 
 /// The decisions that apply to the files a candidate patch changes, as a
 /// fenced block, within `budget` bytes less the `reserved` already used (whole entries, dropped from the end
-/// with a gap). No file means no call and no gap; an aval failure is a gap
+/// with a gap). No file means no call and no gap; a greentopo failure is a gap
 /// and an empty block, never a failed review.
 pub(in crate::runner) fn reviewer_decisions(
     resolver: &dyn context::DecisionResolver,
@@ -726,7 +726,7 @@ pub(in crate::runner) fn reviewer_decisions(
     if changed_files.is_empty() {
         return (String::new(), None);
     }
-    // The choice aval ranks beside each key is the answer at the repository's
+    // The choice greentopo ranks beside each key is the answer at the repository's
     // declared `in_scopes` (aval 1.11.0, ADR-0046); the row names the scope.
     let ranked = match resolver.decisions_for(changed_files) {
         Ok(ranked) => ranked,

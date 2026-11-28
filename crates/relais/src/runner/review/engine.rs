@@ -476,7 +476,7 @@ impl<'a> RunEngine<'a> {
             _ => CandidatesRun::new(
                 sha,
                 self.config
-                    .aval_resolver
+                    .greentopo_resolver
                     .candidates_for(request.base_sha, sha),
             ),
         };
@@ -603,7 +603,7 @@ impl<'a> RunEngine<'a> {
         let guidance_text_len = guidance.text.len();
         let (reviewer_gap, indexed) = (guidance.gap, guidance.indexed);
         let (decisions_text, decisions_gap) = reviewer_decisions(
-            self.config.aval_resolver,
+            self.config.greentopo_resolver,
             &staged.files,
             REVIEW_CONSTRAINTS_BUDGET_BYTES,
             guidance_text_len,

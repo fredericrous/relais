@@ -102,7 +102,7 @@ impl World {
         }
     }
 
-    /// relais.toml with the integrations off (this world has no aval or
+    /// relais.toml with the integrations off (this world has no greentopo or
     /// amont on PATH) and a check that is green only once src/main.rs is
     /// gone — the fix-the-failing-state shape the fake worker knows.
     fn write_policy(&self, max_attempts: u32) -> String {
@@ -1641,6 +1641,99 @@ fn budget_exhaustion_preserves_evidence_and_stops_dispatch() {
     assert_eq!(report["runs"].as_array().map(Vec::len), Some(1));
     assert_eq!(report["runs"][0]["status"], "budget_exhausted");
     assert_eq!(report["runs"][0]["cost_completeness"], "estimated");
+}
+
+/// A required greentopo that fails on a key the task binds blocks the run
+/// before any dispatch as `greentopo_tool_failure` (exit 3), whether the
+/// program runs and fails or cannot be launched at all; only a launch
+/// failure names the declared `bin` and relais.toml.
+#[cfg(unix)]
+#[test]
+fn a_failing_greentopo_blocks_the_run_as_greentopo_tool_failure() {
+    let world = World::new("topo-failure");
+    let fails = world.root.join("greentopo-fails");
+    fake_bin::install_script(&fails, "#!/bin/sh\nexit 3\n");
+    let no_interpreter = world.root.join("greentopo-no-interpreter");
+    std::fs::write(&no_interpreter, "#!/nonexistent/interpreter\n").expect("script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&no_interpreter, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
+    for (bin, names_bin) in [(&fails, false), (&no_interpreter, true)] {
+        let bin = bin.to_str().unwrap();
+        let policy = format!(
+            r#"schema_version = 1
+
+[models.research]
+id = "haiku"
+
+[models.implementation]
+id = "sonnet"
+
+[models.escalation]
+id = "fable"
+
+[execution]
+max_attempts = 1
+max_wall_seconds = 120
+
+[integrations]
+greentopo = {{ mode = "required", bin = "{bin}" }}
+amont = "off"
+amont_agent = "off"
+
+[[verification.profiles.default.commands]]
+argv = ["sh", "-c", "test ! -f src/main.rs"]
+timeout_seconds = 30
+"#
+        );
+        std::fs::write(world.repo.join("relais.toml"), &policy).expect("policy");
+        git(&world.repo, &["add", "relais.toml"]);
+        git(&world.repo, &["commit", "-q", "-m", "policy"]);
+        let hash = RepoPolicy::from_toml_str(&policy)
+            .expect("valid policy")
+            .authority_hash();
+        world.write_machine(&hash, "");
+        let task = world.root.join("task.json");
+        std::fs::write(
+            &task,
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "change",
+                "objective": "Remove the obsolete entry point",
+                "base_ref": "HEAD",
+                "write_scope": ["src/**"],
+                "acceptance": ["src/main.rs no longer exists"],
+                "verification_profile": "default",
+                "review": "off",
+                "architecture": {"keys": ["code.paradigm"]},
+            })
+            .to_string(),
+        )
+        .expect("task");
+        let run = world.relais(&["run", "--task", task.to_str().unwrap()]);
+        let stdout = text(&run.stdout);
+        let stderr = text(&run.stderr);
+        assert_eq!(run.status.code(), Some(3), "{bin}: {stderr}");
+        assert!(
+            stderr.contains("blocked (greentopo_tool_failure): "),
+            "{bin}: {stderr}"
+        );
+        assert!(!stderr.contains("aval"), "{bin}: {stderr}");
+        assert!(!stdout.contains("aval"), "{bin}: {stdout}");
+        if names_bin {
+            assert!(
+                stderr.contains(bin) && stderr.contains("relais.toml"),
+                "{bin}: {stderr}"
+            );
+        }
+        // The fake worker logs every launch beside itself: none happened.
+        assert!(
+            !world.root.join("invocations.log").exists(),
+            "{bin}: a worker was launched"
+        );
+    }
 }
 
 // SPEC §14: missing required integrations, unavailable models and
@@ -5958,7 +6051,7 @@ fn golden_document(world: &World, run_id: &str, label: &str) -> serde_json::Valu
                 }
             }
             // A guidance decision's reason says what the machine has (an
-            // `aval` on PATH or not, and how it failed), and how many of
+            // `greentopo` on PATH or not, and how it failed), and how many of
             // them there are follows from that: the decision and its place
             // in the stream are pinned, its reason and repeats are not.
             if body["kind"] == "decision" && body["what"] == "guidance" {

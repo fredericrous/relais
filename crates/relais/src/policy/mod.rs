@@ -430,7 +430,7 @@ pub struct RiskRule {
     pub minimum_effort: Option<EffortId>,
 }
 
-/// Path-to-decision mappings live here, because aval resolves exact keys
+/// Path-to-decision mappings live here, because greentopo resolves exact keys
 /// and does not provide source-code impact analysis (SPEC §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
@@ -2457,7 +2457,7 @@ pub enum BlockCode {
     ModelUnavailable,
     IntegrationMissing,
     BaseUnresolvable,
-    AvalToolFailure,
+    GreentopoToolFailure,
     ContextSizing,
     BaselineVerificationFailed,
     /// The base revision's checks could not run to a verdict — a program
@@ -2568,7 +2568,7 @@ impl BlockCode {
             Self::ModelUnavailable => "model_unavailable",
             Self::IntegrationMissing => "integration_missing",
             Self::BaseUnresolvable => "base_unresolvable",
-            Self::AvalToolFailure => "aval_tool_failure",
+            Self::GreentopoToolFailure => "greentopo_tool_failure",
             Self::ContextSizing => "context_sizing",
             Self::BaselineVerificationFailed => "baseline_verification_failed",
             Self::BaselineUnrunnable => "baseline_unrunnable",
@@ -2978,7 +2978,7 @@ timeout_seconds = 300
 # minimum_tier = "escalation"
 # review = "required"
 
-# Path-to-aval-key mappings. aval resolves exact keys; it has no
+# Path-to-decision-key mappings. greentopo resolves exact keys; it has no
 # source-impact analysis, so the mapping lives here (SPEC §7).
 # [[architecture.mapping]]
 # paths = ["crates/**"]

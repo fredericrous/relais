@@ -1318,4 +1318,47 @@ mod tests {
         assert_eq!(evidence[0].kind.to_string(), "sandbox_denials");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A run blocked before greentopo's rename stored the block code under the
+    /// old program's name. The row reads back as the string it is, through
+    /// the API `status` and `explain` use; no alias maps it onto the new code.
+    #[test]
+    fn a_run_blocked_under_the_old_tool_failure_code_still_reads_back() {
+        use crate::policy::BlockCode;
+        let (ledger, dir) = temp_ledger();
+        let id = run("run-old-tool-failure");
+        ledger
+            .insert_run(&id, "/repo", None, &task("run-old-tool-failure"), "rk")
+            .expect("run");
+        ledger
+            .record_transition(&Transition {
+                run_id: id.clone(),
+                attempt_id: None,
+                from_state: Some(State::Running),
+                to_state: State::Blocked,
+                reason: Reason::BlockedPreflight.as_str().into(),
+                detail: Some(serde_json::json!({ "code": "aval_tool_failure", "detail": "x" })),
+                at: now_rfc3339(),
+            })
+            .expect("transition");
+        assert_eq!(
+            ledger.run_status(&id).expect("status"),
+            Some(State::Blocked)
+        );
+        let transitions = ledger.transitions(&id).expect("transitions");
+        assert!(transitions.iter().any(|t| t
+            .detail
+            .as_ref()
+            .is_some_and(|d| d["code"] == "aval_tool_failure")));
+        assert!(serde_json::from_str::<BlockCode>("\"aval_tool_failure\"").is_err());
+        let new: BlockCode =
+            serde_json::from_str("\"greentopo_tool_failure\"").expect("the new code parses");
+        assert_eq!(new, BlockCode::GreentopoToolFailure);
+        assert_eq!(new.as_str(), "greentopo_tool_failure");
+        assert_eq!(
+            serde_json::to_string(&new).expect("serializes"),
+            "\"greentopo_tool_failure\""
+        );
+        std::fs::remove_dir_all(&dir).ok(); // best-effort cleanup of the test's temp dir
+    }
 }

@@ -97,7 +97,7 @@ fn git_common_dir(root: &Path) -> Option<PathBuf> {
 }
 
 /// The directory name of the repository's MAIN checkout, which is the name
-/// aval's corpus knows the repository by: the parent of the canonical git
+/// greentopo's corpus knows the repository by: the parent of the canonical git
 /// common directory, so a linked worktree names its main checkout and not
 /// its own directory. `None` when git names no common directory or it has
 /// no named parent.

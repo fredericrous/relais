@@ -2793,7 +2793,7 @@ pub struct Verified {
 /// the argv names, where it resolved and what version it reports, plus
 /// the machine's declared identity.
 ///
-/// `ToolVersions` names relais, aval, amont and Claude Code — none of
+/// `ToolVersions` names relais, greentopo, amont and Claude Code — none of
 /// which decides whether `cargo test` passes. After a `rustup update` or
 /// a new `make`, the old key still matched and a real regression came
 /// back as "failed at the base too" (audit V2).
@@ -4628,7 +4628,7 @@ mod tests {
         let profile = VerificationProfile::default();
         let tools = crate::context::ToolVersions {
             relais: "0.1.0".into(),
-            aval: None,
+            greentopo: None,
             amont: None,
             claude_code: None,
         };
@@ -4682,7 +4682,7 @@ mod tests {
     }
 
     /// V2: the key must move when the TOOLCHAIN moves. `ToolVersions`
-    /// names relais, aval, amont and Claude Code, none of which decides
+    /// names relais, greentopo, amont and Claude Code, none of which decides
     /// whether `cargo test` passes: after a `rustup update` the old key
     /// still matched and a genuine regression came back as
     /// "failed at the base too".
@@ -4700,7 +4700,7 @@ mod tests {
         };
         let tools = crate::context::ToolVersions {
             relais: "0.1.0".into(),
-            aval: None,
+            greentopo: None,
             amont: Some("amont 1.36.1".into()),
             claude_code: None,
         };
@@ -4978,7 +4978,7 @@ mod tests {
         };
         let tools = crate::context::ToolVersions {
             relais: "0.2.0".into(),
-            aval: None,
+            greentopo: None,
             amont: None,
             claude_code: None,
         };

@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use crate::context::candidates::{Candidate, CandidateList};
-use crate::context::AvalCli;
+use crate::context::GreentopoCli;
 use crate::verify::CandidatesRecord;
 
 use super::review_parts::{answer_review_parts, parts_backend, run_stopped_over_budget};
@@ -46,8 +46,8 @@ impl Listing {
 }
 
 impl crate::context::DecisionResolver for Listing {
-    fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
-        AvalVerdict::Unknown
+    fn resolve(&self, _key: &str, _scope: Option<&str>) -> GreentopoVerdict {
+        GreentopoVerdict::Unknown
     }
 
     fn candidates_for(&self, base: &str, head: &str) -> Result<CandidateList, GuidanceGap> {
@@ -286,11 +286,11 @@ fn no_candidates_adds_nothing_to_the_prompt() {
 
 /// A resolver that asks the real adapter for greenspotter's candidates, with
 /// `program` standing in for greenspotter.
-struct SpawningGreenspotter(AvalCli);
+struct SpawningGreenspotter(GreentopoCli);
 
 impl crate::context::DecisionResolver for SpawningGreenspotter {
-    fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
-        AvalVerdict::Unknown
+    fn resolve(&self, _key: &str, _scope: Option<&str>) -> GreentopoVerdict {
+        GreentopoVerdict::Unknown
     }
 
     fn candidates_for(&self, base: &str, head: &str) -> Result<CandidateList, GuidanceGap> {
@@ -317,7 +317,7 @@ fn the_review_runs_without_candidates(program: impl FnOnce(&Fixture) -> String, 
     let repo = fixture.repo_policy(vec![main_gone_check()], 3);
     let program = program(&fixture);
     let resolver =
-        SpawningGreenspotter(AvalCli::new(fixture.repo.clone()).with_greenspotter(program));
+        SpawningGreenspotter(GreentopoCli::new(fixture.repo.clone()).with_greenspotter(program));
     let (backend, prompts) = ruling_backend(conditional_worker("relais task"), |_| String::new());
     let receipt = accepted(fixture.execute_as_resolving(
         &resolver,
@@ -378,7 +378,7 @@ fn the_real_adapter_spawns_greenspotter_with_the_runs_base_and_the_candidate() {
         &format!("echo \"$@\" > '{}'\nprintf '%s' '{json}'", argv.display()),
     );
     let resolver =
-        SpawningGreenspotter(AvalCli::new(fixture.repo.clone()).with_greenspotter(program));
+        SpawningGreenspotter(GreentopoCli::new(fixture.repo.clone()).with_greenspotter(program));
     let (backend, _) = ruling_backend(conditional_worker("relais task"), |_| String::new());
     let receipt = accepted(fixture.execute_as_resolving(
         &resolver,
@@ -563,7 +563,7 @@ fn sample_receipt() -> crate::verify::Receipt {
 
 const FLEET_RULES_JSON: &str = r#"{"rules":[{"active":true,"adopts":"ADR-0011","body":"BODY-OF-NAMES-REVEAL-INTENT","file":"aval.pack","governs":"code","id":"names.reveal-intent","level":"constraint","pack":"decisions","source":"x","statement":"STATEMENT-OF-NAMES-REVEAL-INTENT"}]}"#;
 
-/// A repository with no decisions corpus (aval exits 3 there) whose code
+/// A repository with no decisions corpus (greentopo exits 3 there) whose code
 /// rules come from the fleet decisions directory, and whose greenspotter lists
 /// a candidate; every call is logged in order.
 struct NoCorpus {
@@ -571,8 +571,8 @@ struct NoCorpus {
 }
 
 impl crate::context::DecisionResolver for NoCorpus {
-    fn resolve(&self, _key: &str, _scope: Option<&str>) -> AvalVerdict {
-        AvalVerdict::Unknown
+    fn resolve(&self, _key: &str, _scope: Option<&str>) -> GreentopoVerdict {
+        GreentopoVerdict::Unknown
     }
 
     fn constraint_rules(&self) -> Result<crate::context::Rules, GuidanceGap> {

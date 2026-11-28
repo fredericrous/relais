@@ -1144,7 +1144,7 @@ fn execute_predicted(
 ) -> RunOutcome {
     let mut machine = fixture.machine_for(repo);
     machine.routing.learned_enabled = true;
-    let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+    let resolver = |_: &str, _: Option<&str>| GreentopoVerdict::Active {
         adr: "ADR-0001".into(),
         choice: None,
         reason: None,
@@ -1163,7 +1163,7 @@ fn execute_predicted(
         hooks: &crate::verify::FixedInventory(None),
         attest: &crate::verify::FixedAttest::default(),
         artifacts_dir: fixture.artifacts.clone(),
-        aval_resolver: &resolver,
+        greentopo_resolver: &resolver,
         predictor: Some(predictor),
         gate: None,
         session_id: "test-session".into(),
