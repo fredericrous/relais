@@ -1,5 +1,5 @@
 ---
-status: active
+status: done
 branch: fix/f33-home-drift-attribution
 repos: [relais]
 adrs: []
@@ -202,7 +202,7 @@ suffix. `Unexplained { calls_read: false }` prints its cause line as
   walk taken out of `runner/holdout_exposure.rs`; report order and the
   count line; tests in `homeprint.rs` and `runner/tests/home_drift.rs`;
   SPEC §8 text; `CHANGELOG.md` Unreleased.
-- [ ] Phase 2 — release through the `tag-release` skill (`CHANGELOG.md`,
+- [x] Phase 2 — release through the `tag-release` skill (`CHANGELOG.md`,
   `Cargo.toml`, `Cargo.lock`), so that f08's count (due 2026-11-28) runs
   against attributed rows; then `brew upgrade relais`.
 
@@ -266,6 +266,22 @@ plugin):
 - `relais status` and `relais explain` on that run → the warning's
   order.
 
+Observed on 2026-11-28 with relais 0.93.0 from brew:
+
+- Pilot, run-6614c34d3f6a2-141f7: an inspect task in a detached scratch
+  worktree of this repository (a worktree shares the repo's `.git/config`,
+  so it stands in for the clone and needs no new trust grant), with
+  `git worktree add -b f33-pilot-probe` run 15 s after the start → one
+  `writer` row → `home-drift-1.json` is `.git/config`, `cause.kind`
+  `writer`, name `git branch tracking`; no other row. The run itself
+  stopped on `admission_wait_exhausted` before its worker launched, and
+  the watch still covered the wait.
+- `relais status` and `relais explain` on it → the heading and
+  `1 by known writer: git branch tracking`, with no follow-up lines → as
+  expected. `relais status run-661331673623e-5441` (a row with no cause)
+  → its path line and the follow-up lines, as before → as expected.
+- The probe branch and both worktrees were removed afterwards.
+
 ## Decision log
 
 - 2026-11-26 — worker-named drifts keep their own line and only
@@ -306,6 +322,18 @@ plugin):
   `canonicalize` (`\\?\`, 8.3 names), and the worker-write line is built
   with `json!`. A first try gated the 6 tests to unix; review refused it
   (`general.no-disabled-safety`), and the gates are gone.
+- 2026-11-28 — released as v0.93.0 (PR #640, merge `4db53146c`), installed
+  through brew. Two Windows wall-clock tests flaked on the way
+  (`setup_keeps_one_slot` at the land, `timeout_rerun` on #640's CI), and
+  each passed on a rerun.
+
+## Outcome
+
+Shipped in relais v0.93.0 on 2026-11-28. Every new `home_drift` row now
+carries a `cause`, and the warning, `status` and `explain` list unexplained
+drifts first, then worker-named ones, then one count line per known writer.
+f08's count can now tell explained from unexplained rows from this release
+on.
 
 ## Implementation review
 
@@ -313,6 +341,7 @@ plugin):
 - backend approve-with-changes (83k, 103 s; Delta approve 32k, 21 s): input trimming, unreadable-agent line, `holds-until:` fixed; `--git-dir` not followed deliberate: such writes still print as Bash calls.
 - lang:rust approve-with-changes (75k, 118 s; Delta 32k, 19 s): relative `-C`/`cd`, `TargetKind`, cache once, extra compare fixed; per-call timestamp parse, writer-name constants, nested `Option` in `Step`, one clone, tool list twice deliberate: low, no behaviour change.
 - architect approve (57k, 39 s): cache once fixed; `WorkerCall` beside `Cause::Call` deliberate: the port's return shape. unix approve (55k, 49 s): no findings.
+- Closing docs (f33 close, f46): approve-with-changes (63k, 39 s); one handoff in the map and f46's line range fixed; Delta approve (66k, 15 s). Profiles on tree de1fbe74: rust, unix, architect approve; backend approve-with-changes, 2 low on f46 deliberate: the ticket already quotes `suspended_ms: 0` and asks whether the retry draws on work.
 - Windows round (after the red CI): unix gates refused as blocking, replaced by the separator fix; all five approve on tree 52e06cd8 (rust's `Cow` instead of a `String` copy deliberate: low).
 
 <!-- panel: repos=relais adds= reviewers=backend,lang:rust,tui,unix,codex body-sha=a20afd906fa8 -->
