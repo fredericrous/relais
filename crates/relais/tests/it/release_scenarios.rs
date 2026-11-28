@@ -1717,7 +1717,7 @@ timeout_seconds = 30
         let stderr = text(&run.stderr);
         assert_eq!(run.status.code(), Some(3), "{bin}: {stderr}");
         assert!(
-            stderr.contains("blocked: greentopo_tool_failure"),
+            stderr.contains("blocked (greentopo_tool_failure): "),
             "{bin}: {stderr}"
         );
         assert!(!stderr.contains("aval"), "{bin}: {stderr}");
