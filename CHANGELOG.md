@@ -52,6 +52,14 @@ agent), or unexplained. The warning at the end of `relais run`, and
 worker-named ones, then one count line per known writer. An old record
 prints as it did.
 
+A verification command waits for a host slot through greengate's one wait
+loop (`greenharness-slots` 5.5, `wait_in_line_paced`; amont ADR-0022)
+instead of relais's own copy of it: the stall rule, the poll-failure count and
+the journal rows are unchanged, and relais still heartbeats its lease, charges
+its budgets and honours a cancel between polls. `greenharness-slots` 5.5 is now
+the minimum. `procs::load_average` is gone; read `greenharness_slots::load1`
+(programme relais-modularise t05).
+
 ## v0.92.0
 
 **Breaking: the old name `aval` is gone.** `[integrations] greentopo` is the

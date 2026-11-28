@@ -360,9 +360,9 @@ dependencies = [
 
 [[package]]
 name = "greenharness-slots"
-version = "5.0.0"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8751f70cbf7cc581180340aa56d7eaa27b2fb815f4918f8cee803c100477230a"
+checksum = "b92d0fa84d7642895867ce86ef00faa57fcadabd238f897c7f0d5ece293284c8"
 
 [[package]]
 name = "hashbrown"

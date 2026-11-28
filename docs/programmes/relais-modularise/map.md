@@ -63,23 +63,35 @@ met: the build time after a one-line edit, and the size of the largest file.
   edit in `verify/` or `runner/` rebuilds in ≤ 10 s, and no production file
   exceeds 700 non-blank lines (56 files do today)
   ([t02](t02-seams.md)).
+- Wait loop: relais waits for a host slot through greengate's one loop,
+  `greenharness-slots` 5.5's `wait_in_line_paced`, where the caller owns the
+  pause between polls. `load_average` gives way to `load1`. About 12
+  production lines net came out: one loop, little code saved
+  ([t05](t05-wait-loop-cancel-seam.md)).
 
 ## Handoff
 
-2026-11-27, boundary: t02 closed (grilling with the person).
+2026-11-27, boundary: t05 closed (the wait-loop seam).
 
-- Done: t01 (#619), t03 (#621), t02 (this change).
+- Done: t01 (#619), t03 (#621), t02 (#639), t05: greenharness/greengate#538
+  and its 5.5.0 release (#540), and relais on this change.
 - Live state: nothing in flight for this programme. epic-vocabulary's t01
-  (the vocabulary) is still open, and its rename implementation must land
-  before the `programme` crate is cut.
+  is still open, and its rename must land before the `programme` crate is
+  cut.
 - Next, in order: t04 (names, `hitl`: needs the person), then the split
-  stories once named. t05 (wait-loop cancel seam, `afk`) is ready now and
-  independent; t06 (what slots-off means, `hitl`) is ready.
-- Accepted gaps: the rebuild baseline is still t01's busy-host sample; the
-  first split story re-measures it on a quiet host. Line counts in t03 are
-  estimates from symbol ranges.
-- Lesson: a module graph read with comments included shows cycles that
-  are only rustdoc links; drop comment lines before judging layers.
+  stories once named. t06 (what slots-off means, `hitl`) is ready. t07
+  (a week of slot waits through greengate's loop) is due 2026-12-08.
+- Accepted gaps:
+  - The rebuild baseline is still t01's busy-host sample; the first split
+    story re-measures it on a quiet host.
+  - t05's 360 s live pilot was not run. A heartbeat-per-pause test stands in
+    for it.
+- Lessons:
+  - A module graph read with comments included shows cycles that are only
+    rustdoc links; drop comment lines before judging layers.
+  - A pack refresh written with this Mac's greentopo 3.0.0 fails CI's 2.0.0
+    heads-fresh check; regenerate with the pinned version until follow-ups
+    f36 lands.
 
 ## Not yet specified
 

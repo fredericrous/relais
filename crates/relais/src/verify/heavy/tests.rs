@@ -1529,6 +1529,96 @@ mod host_slots {
         assert!(written.contains("admission_queue_unreadable"), "{written}");
     }
 
+    /// A cancel during a host-slot wait ends it from relais's side of the
+    /// pause: `Cancelled`, one `deferred` row with no `end`, and the waiter
+    /// has left the queue (no ticket of it is left in the directory).
+    #[test]
+    fn a_cancel_while_queued_for_a_host_slot_ends_the_wait_and_leaves_the_line() {
+        let slots_dir = slot_dir("cancel");
+        let _held = other_holder(&slots_dir, "xcodebuild");
+        let gate = Recording::new(gate_with(1));
+        register(&gate.inner, "run-c");
+        let clock = ManualClock::new();
+        let mut with_slots = admission(&gate, "run-c", 1, 4);
+        with_slots.slots = Some(slots_dir.clone());
+        with_slots.sizing = Some(greenharness_slots::Sizing::Fixed(1));
+        with_slots.budgets = budgets_on(&clock, 600);
+        with_slots.poll = Duration::from_millis(5);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        with_slots.sleeper = Advancing::then(&clock, move |number| {
+            if number == 2 {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+        let env = BTreeMap::new();
+        let mut asked = ask(&env, 1);
+        asked.cancel = Some(&cancel);
+        let stop = with_slots
+            .admit(&asked)
+            .err()
+            .expect("a cancel ends the wait");
+        assert!(matches!(stop, LeaseStop::Cancelled), "{stop:?}");
+        // Every pause beat the lease before it slept: the coordinator never
+        // saw the queued lease go quiet. The cancel is read on the third.
+        let beats = gate
+            .events()
+            .iter()
+            .filter(|e| e.starts_with("heartbeat "))
+            .count();
+        assert_eq!(beats, 3, "one heartbeat per pause: {:?}", gate.events());
+        let journal = std::fs::read_to_string(slots_dir.join("waits.jsonl")).expect("waits.jsonl");
+        let deferred: Vec<&str> = journal
+            .lines()
+            .filter(|l| l.contains("\"tool\":\"relais\"") && l.contains("\"outcome\":\"deferred\""))
+            .collect();
+        assert_eq!(deferred.len(), 1, "{journal}");
+        assert!(!deferred[0].contains("\"end\""), "{journal}");
+        let queue = greenharness_slots::status_in(&slots_dir, greenharness_slots::Sizing::Fixed(1))
+            .expect("status");
+        assert_eq!(
+            queue.waiting, 0,
+            "the cancelled waiter left the line: {queue:?}"
+        );
+        std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
+    }
+
+    /// A lock that fails before the line was joined turns the host slots off
+    /// for the run, said once with its cause, and the command runs unqueued
+    /// (`Ok(None)` from the wait: no host slot held), as it did before the
+    /// crate's loop.
+    #[test]
+    fn a_lock_that_fails_before_joining_turns_the_host_slots_off_once() {
+        let dir = temp_dir("slots-prejoin");
+        let slots_dir = slot_dir("prejoin");
+        // `admission` as a directory: the ticket is made, the lock cannot be.
+        // Relies on the crate's lock file name (greenharness-slots `poll_with`).
+        std::fs::create_dir(slots_dir.join("admission")).expect("admission dir");
+        let gate = Recording::new(gate_with(1));
+        register(&gate.inner, "run-pj");
+        let clock = ManualClock::new();
+        let mut with_slots = admission(&gate, "run-pj", 1, 4);
+        with_slots.slots = Some(slots_dir.clone());
+        with_slots.sizing = Some(greenharness_slots::Sizing::Fixed(1));
+        with_slots.budgets = budgets_on(&clock, 600);
+        with_slots.poll = Duration::from_millis(5);
+        with_slots.sleeper = Advancing::new(&clock);
+        with_slots.events =
+            Events::for_run_on("run-pj", &dir, crate::protocol::Wire::to(std::io::sink()));
+        let lease = with_slots
+            .admit(&ask(&BTreeMap::new(), 1))
+            .expect("the command runs without a host slot");
+        assert_eq!(lease.host_slots(), 0);
+        let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        assert_eq!(written.matches("host_slots_off").count(), 1, "{written}");
+        assert!(
+            written.contains("a host slot could not be locked"),
+            "{written}"
+        );
+        drop(lease);
+        std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
+    }
+
     /// ADR-0015: the coordinator's queue and the host-slot queue charge the
     /// same budget, and the overrun of one never lets the other off: a
     /// coordinator wait, a host-slot wait past the budget, then a coordinator
