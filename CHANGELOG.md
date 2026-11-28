@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.93.0
+
 `relais learn cycle --json` now prints one JSON object for a cycle that did
 not run, on exit 0, instead of the plain `deferred: not idle` and `not due`
 lines: `{"outcome":"deferred","reason":"not_idle","agents":<n>}` or
