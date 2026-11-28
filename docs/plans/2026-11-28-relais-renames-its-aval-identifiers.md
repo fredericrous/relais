@@ -36,7 +36,7 @@ decisions topo-spotter-rename t28, relais slice. t22 kept relais's internal
 `Aval*` names and three stored names because three branches were open
 (an-t35, f73, f33); all three have merged. This renames them after
 greentopo, so relais's code says the name of the program it runs, and new
-records carry the new stored names. Released as relais 0.94.0 and installed
+records carry the new stored names. Released as relais 0.95.0 (0.94.0 was another session's, cut while this ran) and installed
 on this Mac.
 
 ## Non-goals
@@ -99,7 +99,7 @@ on this Mac.
   relais version, so the rename costs no extra baseline run.
 
 ## Phases
-- [ ] Phase 1 — rename the identifiers and stored names:
+- [x] Phase 1 — rename the identifiers and stored names:
   `crates/relais/src/context/mod.rs`, `crates/relais/src/context/guidance.rs`,
   `crates/relais/src/context/candidates.rs`, `crates/relais/src/policy/mod.rs`,
   `crates/relais/src/cli/run.rs`, `crates/relais/src/cli/replay.rs`,
@@ -113,7 +113,7 @@ on this Mac.
   `crates/relais/src/runner/tests/exhaustion.rs`,
   `crates/relais/src/runner/tests/verify_kind.rs`,
   `crates/relais/tests/it/release_scenarios.rs`
-- [ ] Phase 2 — back-compat tests: an old manifest with `tool_versions.aval`,
+- [x] Phase 2 — back-compat tests: an old manifest with `tool_versions.aval`,
   `guidance.aval_version` and an `aval_too_old` gap parses, with
   `greentopo: None` and the cause `GapCause::Unknown`, as does an arbitrary
   `"unknown_x"` (context tests); a ledger row with
@@ -122,7 +122,7 @@ on this Mac.
   `serde_json::from_str::<BlockCode>` of it is `Err` (no alias), beside
   `a_run_with_sandbox_era_rows_still_reads_back` without its round-trip:
   `crates/relais/src/context/mod.rs`, `crates/relais/src/ledger/mod.rs`
-- [ ] Phase 3 — release 0.94.0 through the `tag-release` skill, install it,
+- [ ] Phase 3 — release 0.95.0 through the `tag-release` skill, install it,
   print `relais --version`. The CHANGELOG entry names each old → new stored
   name (`aval_tool_failure`, `tool_versions.aval`, `guidance.aval_version`,
   `aval_too_old`) and says old rows keep the old string: `CHANGELOG.md`,
@@ -141,13 +141,29 @@ on this Mac.
   (hsa-t15 adds no aval-named code, so its conflicts are mechanical).
 - 2026-11-28 — minor release: the `blocked:` code and manifest fields are
   output a reader can see, renamed for new records.
+- 2026-11-28 — the fleet pack was refreshed on this branch in its own
+  commit (ab130b51a), because worktree-task's Start step found it behind
+  decisions; it changes no code.
+- 2026-11-28 — checks ran with `PATH=$HOME/.cargo/bin:$PATH`: Homebrew
+  `rust` 1.100.0 (reinstalled 11-27) shadows the rustup 1.94.1 pin, and its
+  clippy fails pre-existing code (`verify/heavy/tests.rs` `fetch_update`).
 
 ## Verification
 - Phase 1: `git grep -cw <token> -- crates` per name, before → after: each
   old token 0 outside the Non-goals' list; each new one = old count + its
-  own count before (`greentopo_resolve`: +2, MCP tool names) → <result>
+  own count before (`greentopo_resolve`: +2, MCP tool names) → every
+  renamed token 0, but 4 back-compat test inputs (`aval_tool_failure` ×3
+  in the ledger test, `aval_version` ×1 in the manifest test); new counts
+  equal the old (`GreentopoVerdict` 95, `greentopo_resolver` 25,
+  `parse_greentopo_output` 13, `GreentopoCli` 13, `fake_greentopo` 12,
+  `run_greentopo` 10; `greentopo_resolve` 2 + 2 MCP names)
 - Phase 1–2: `cargo test -p relais` through `greengate slot run` → green,
-  including the new back-compat tests → <result>
+  including the new back-compat tests → `cargo test -p relais` green
+  before the review fixes (lib 2803, it 368, others 99/26/16/25/1; 5
+  ignored); after them, on the pinned 1.94.1, `cargo clippy -p relais
+  --all-targets -- -D warnings` clean, `--lib context:: ledger::` 284
+  passed, the integration test 1 passed. `#[serde(other)]` works on this
+  externally tagged enum (the test pins it)
 - Phase 1: pilot `relais run` using the existing CLI integration-test
   setup (isolated state, trust, supported backend and session prerequisites),
   a clean scratch repository and a contract with one binding architecture
@@ -158,13 +174,33 @@ on this Mac.
   shebang names a nonexistent interpreter: it passes file discovery but
   fails to launch; expect the same code and exit, with the declared `bin`
   and relais.toml named in the hint. Record stdout and stderr separately
-  and assert neither case launches a worker → <result>
-- Phase 3: `relais --version` → `relais 0.94.0` → <result>
+  and assert neither case launches a worker → done as the integration test
+  `a_failing_greentopo_blocks_the_run_as_greentopo_tool_failure` (the
+  scenario World is the CLI harness): both bins exit 3, stderr carries
+  `blocked (greentopo_tool_failure): \`code.paradigm\`: unparseable
+  greentopo output: ""` (relais prints `blocked (<code>): <detail>`, not
+  the `blocked: <code>` this line first expected), only the launch failure
+  names the `bin` and relais.toml, no `aval` on either stream, and the fake
+  worker's `invocations.log` is never written
+- Phase 3 (next, the release): `relais --version` → `relais 0.95.0`
 - Census, on `HEAD` before the push and on `origin/main` after the merge,
   outside CHANGELOG, `docs/plans`, `docs/programmes`, `.adr/packs` and
   `HEADS.md`: `git grep -nIiE '(^|[^[:alpha:]])aval|adr-lint'` plus
-  case-sensitive `git grep -nE '[a-z]Aval'` → only the Non-goals' list →
-  <result>
+  case-sensitive `git grep -nE '[a-z]Aval'` → on HEAD 59d75c9e9 only the
+  Non-goals' list: `RETIRED_TOPO_KEY`/`RetiredAvalIntegrationKey` and their
+  refusal tests (`policy/mod.rs`), the `only_aval_on_path_*` tests
+  (`tooling.rs`, `context/mod.rs`), version facts (`guidance.rs`,
+  `context/mod.rs:48`, `review/mod.rs:730`), `aval.pack` inside recorded
+  rule JSON, the old `adr-lint.candidates/1` refusal input, the
+  back-compat test inputs, `checked-by.txt`, `.adr.yaml`'s `aval 1.7`,
+  `greengate.conf`'s vendored glob, dated `docs/AUDIT-*`/`docs/REVIEW-*`
+  and `docs/SPEC.md` refusal/history text
+
+## Implementation review
+- implementation-review (opus): approve-with-changes ×3; fixed: `.ok()` reason, `m`→`written`, the integration test's no-dispatch/stdout/real-format checks; ticks, results, pack line here. ~230k tok, 120 s.
+- backend: approve-with-changes → approve; deliberate: no negative bin-name check for the exit-3 case (tui asked to leave room to name the program). 123k, 96 s.
+- lang:rust: approve-with-changes → approve; `Unknown` comment narrowed, its limits pinned. 88k, 61 s.
+- unix: approve-with-changes → approve. 79k, 62 s. tui: approve; follow-up: name the program and exit code in the unparseable-output detail. 56k, 44 s.
 
 ## Outcome
 <!-- panel: repos=relais reviewers=backend,lang:rust,tui,unix,codex body-sha=40115fecb59c -->
