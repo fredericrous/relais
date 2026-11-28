@@ -1276,8 +1276,9 @@ mod host_slots {
         assert_eq!(released.len(), 1, "{journal}");
         assert!(released[0].contains("\"tool\":\"relais\""), "{journal}");
         assert!(released[0].contains("\"held_ms\":"), "{journal}");
-        // The run's id is the holder's session, so the release names the run.
-        for part in ["\"session\":\"run-w2\"", "\"weight\":1,", "\"jobs\":2,"] {
+        // The dispatching session is the holder's session (t24), so the
+        // release names it, not the run.
+        for part in ["\"session\":\"tab\"", "\"weight\":1,", "\"jobs\":2,"] {
             assert!(released[0].contains(part), "{part} in {journal}");
         }
         std::fs::remove_dir_all(&scratch).ok(); // best-effort: a scratch dir
@@ -1481,6 +1482,176 @@ mod host_slots {
             written.contains("\"behind\":\"other: xcodebuild"),
             "{written}"
         );
+        std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
+    }
+
+    /// With no session, or only the `unattributed-` stand-in that no caller
+    /// of `slot promote` ever is, the run id names the holder (t24).
+    #[test]
+    fn a_holder_with_no_real_session_is_named_by_its_run() {
+        let gate = gate_with(1);
+        for (session, expected) in [
+            ("", "run-e"),
+            ("unattributed-ppid-7", "run-e"),
+            ("tab", "tab"),
+        ] {
+            let mut shared = admission(&gate, "run-e", 1, 4);
+            shared.session_id = session.into();
+            let holder = slots::holder(&shared, "cmd0");
+            assert_eq!(holder.session, expected, "session {session:?}");
+            assert_eq!(
+                (holder.tool.as_str(), holder.command.as_str()),
+                ("relais", "cmd0")
+            );
+        }
+    }
+
+    /// amont host-slot-admission t24: a relais job belongs to the session
+    /// that dispatched its run, so that session, and only it, moves the job
+    /// ahead (`greengate slot promote`), and the pane's place drops with it.
+    #[test]
+    fn the_dispatching_session_moves_its_relais_job_ahead_and_no_other_can() {
+        use greenharness_slots::{JobState, Promote, Refused};
+        let dir = temp_dir("slots-promote");
+        let slots_dir = slot_dir("promote");
+        let held = Arc::new(Mutex::new(Some(other_holder(&slots_dir, "xcodebuild"))));
+        // Two waiters of another session join first. They never poll again,
+        // so the relais job is granted before them only if it moved.
+        let theirs = |command: &str| {
+            let mut holder = greenharness_slots::Holder::here("other", command);
+            holder.session = "session-other".into();
+            let mut waiter = greenharness_slots::Waiter::new_in(
+                &slots_dir,
+                greenharness_slots::Sizing::Fixed(1),
+                1,
+                holder,
+            )
+            .expect("waiter");
+            match waiter.poll().expect("poll") {
+                greenharness_slots::Poll::Waiting(_) => waiter,
+                greenharness_slots::Poll::Granted(_) => panic!("the slot is held"),
+            }
+        };
+        let first = theirs("a");
+        let second = theirs("b");
+        let gate = Recording::new(gate_with(1));
+        register(&gate.inner, "run-p");
+        let clock = ManualClock::new();
+        let mut with_slots = admission(&gate, "run-p", 1, 4);
+        with_slots.slots = Some(slots_dir.clone());
+        with_slots.sizing = Some(greenharness_slots::Sizing::Fixed(1));
+        with_slots.budgets = budgets_on(&clock, 600);
+        with_slots.events =
+            Events::for_run_on("run-p", &dir, crate::protocol::Wire::to(std::io::sink()));
+        with_slots.announce_every = Duration::from_millis(1);
+        with_slots.poll = Duration::from_millis(5);
+        // A wait announces its place before it sleeps, once the clock has
+        // moved, so from the third sleep on the pane has been told place 2.
+        // From then each wait tries the moves until one lands (the admission
+        // lock can read busy for a few polls while another test forks). The
+        // holder lets go three waits after the move, so place 0 is announced
+        // first. After 400 waits it lets go anyway, and a short stall window
+        // ends an unmoved wait, so a move that never lands fails the asserts
+        // below instead of hanging. (The events file is read only after the
+        // grant: it is not flushed while the wait runs.)
+        type Tried = (Option<Refused>, Option<(greenharness_slots::Moved, usize)>);
+        let tried = Arc::new(Mutex::new(Tried::default()));
+        let noted = Arc::clone(&tried);
+        let release = Arc::clone(&held);
+        let queue_dir = slots_dir.clone();
+        with_slots.stall_window = Duration::from_secs(5);
+        with_slots.sleeper = Advancing::then(&clock, move |number| {
+            let mut tried = noted.lock().expect("tried");
+            if tried.1.is_none() && number >= 3 {
+                let queue = greenharness_slots::queue_in(&queue_dir).unwrap_or_default();
+                let job = queue.iter().find(|j| {
+                    matches!(j.state, JobState::Waiting { .. })
+                        && j.holder.as_ref().is_some_and(|h| h.tool == "relais")
+                });
+                if let Some(job) = job {
+                    let ask = |session| Promote {
+                        id: &job.id,
+                        session,
+                        reason: "the person waits on this run",
+                        to: 0,
+                        tool: "test",
+                    };
+                    if tried.0.is_none() {
+                        if let Ok(Err(refused)) =
+                            greenharness_slots::promote_in(&queue_dir, &ask("session-other"))
+                        {
+                            tried.0 = Some(refused);
+                        }
+                    }
+                    if tried.0.is_some() {
+                        if let Ok(Ok(moved)) =
+                            greenharness_slots::promote_in(&queue_dir, &ask("tab"))
+                        {
+                            tried.1 = Some((moved, number));
+                        }
+                    }
+                }
+            }
+            if tried.1.as_ref().is_some_and(|(_, at)| number >= at + 3) || number >= 400 {
+                release.lock().expect("held").take();
+            }
+        });
+        let lease = with_slots
+            .admit(&ask(&BTreeMap::new(), 1))
+            .expect("the moved job is granted");
+        let (refused, moved) = tried.lock().expect("tried").clone();
+        let refused = refused.expect("a move from another session was answered");
+        assert_eq!(refused.limit(), "own-session", "{}", refused.describe());
+        let moved = moved.map(|(moved, _)| moved).unwrap_or_else(|| {
+            // Say why the owner's move did not land (an `age-floor` on a
+            // slow host, say), not only that it did not.
+            let why = greenharness_slots::queue_in(&slots_dir).ok().and_then(|q| {
+                let job = q
+                    .into_iter()
+                    .find(|j| j.holder.as_ref().is_some_and(|h| h.tool == "relais"))?;
+                let ask = Promote {
+                    id: &job.id,
+                    session: "tab",
+                    reason: "why",
+                    to: 0,
+                    tool: "test",
+                };
+                Some(format!(
+                    "{:?}",
+                    greenharness_slots::promote_in(&slots_dir, &ask)
+                ))
+            });
+            panic!("the dispatching session moved its job: {why:?}")
+        });
+        assert_eq!((moved.from, moved.to), (2, 0), "{moved:?}");
+        // Granted ahead of both: the two other waiters still wait.
+        let waiting: Vec<_> = greenharness_slots::queue_in(&slots_dir)
+            .expect("queue")
+            .into_iter()
+            .filter(|j| matches!(j.state, JobState::Waiting { .. }))
+            .filter_map(|j| j.holder.map(|h| h.command))
+            .collect();
+        assert_eq!(waiting, ["a", "b"]);
+        // The pane reads the place from each wait event: 2 before, 0 after.
+        let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        let places: Vec<u64> = written
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|line| line["event"].clone())
+            .filter(|e| e["kind"] == "waiting_for_slot" && e["class"] == "host_slot")
+            .filter_map(|e| e["position"].as_u64())
+            .collect();
+        assert_eq!(places.first(), Some(&2), "{written}");
+        assert!(places.contains(&0), "{written}");
+        drop(lease);
+        // The release row names the dispatching session, not the run.
+        let journal = std::fs::read_to_string(slots_dir.join("waits.jsonl")).expect("journal");
+        let released = journal
+            .lines()
+            .find(|l| l.contains("\"outcome\":\"released\"") && l.contains("\"tool\":\"relais\""))
+            .expect("a relais release row");
+        assert!(released.contains("\"session\":\"tab\""), "{released}");
+        drop((first, second));
         std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
     }
 

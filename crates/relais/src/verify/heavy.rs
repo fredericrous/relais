@@ -1508,13 +1508,23 @@ mod slots {
         Ok(Some(dir.to_path_buf()))
     }
 
-    /// The holder record of a relais command: its label, under the run.
+    /// The holder record of a relais command: its label, under the session
+    /// that dispatched the run, so that session may move it ahead with
+    /// `greengate slot promote` (amont host-slot-admission t06, t24). With
+    /// no session, or only the `unattributed-` stand-in, the run id names
+    /// it: no caller is either, and the run id tells such rows apart where
+    /// an 8-character `unattrib` would not.
     pub(super) fn holder(
         admission: &HeavyAdmission<'_>,
         label: &str,
     ) -> greenharness_slots::Holder {
         let mut holder = greenharness_slots::Holder::here("relais", label);
-        holder.session = admission.run_id.clone();
+        let session = &admission.session_id;
+        holder.session = if session.is_empty() || session.starts_with("unattributed-") {
+            admission.run_id.clone()
+        } else {
+            session.clone()
+        };
         holder
     }
 
