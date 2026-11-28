@@ -376,7 +376,7 @@ pub(crate) fn replay_command(
     };
 
     let git = relais::workspace::SystemGit;
-    let aval_resolver = relais::context::AvalCli::new(checkout_dir.clone()).with_bin(
+    let greentopo_resolver = relais::context::GreentopoCli::new(checkout_dir.clone()).with_bin(
         candidate
             .policy()
             .integrations
@@ -449,7 +449,7 @@ pub(crate) fn replay_command(
         hooks: &hooks,
         attest: &attest,
         artifacts_dir: artifacts_dir.clone(),
-        aval_resolver: &aval_resolver,
+        greentopo_resolver: &greentopo_resolver,
         predictor: None,
         gate: Some(&gate),
         session_id: session.id.clone(),

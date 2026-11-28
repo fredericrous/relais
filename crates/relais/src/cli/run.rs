@@ -267,7 +267,7 @@ pub(crate) fn run_command(
     // The three tools a run talks to, each behind the port this crate
     // owns: git, the decision corpus and the check inventory.
     let git = relais::workspace::SystemGit;
-    let aval_resolver = relais::context::AvalCli::new(root.clone()).with_bin(
+    let greentopo_resolver = relais::context::GreentopoCli::new(root.clone()).with_bin(
         repo.integrations
             .greentopo
             .as_ref()
@@ -535,7 +535,7 @@ pub(crate) fn run_command(
         hooks: &hooks,
         attest: &attest,
         artifacts_dir: artifacts_dir.clone(),
-        aval_resolver: &aval_resolver,
+        greentopo_resolver: &greentopo_resolver,
         predictor: predictor
             .as_ref()
             .map(|predictor| predictor as &dyn route::RoutePredictor),

@@ -30,9 +30,9 @@ pub struct RunConfig<'a> {
     /// covered`), as a port.
     pub attest: &'a dyn verify::HookAttest,
     pub artifacts_dir: PathBuf,
-    /// aval resolution, injectable so runs are testable without the real
-    /// corpus; production wiring passes a `context::AvalCli`.
-    pub aval_resolver: &'a dyn context::DecisionResolver,
+    /// greentopo resolution, injectable so runs are testable without the real
+    /// corpus; production wiring passes a `context::GreentopoCli`.
+    pub greentopo_resolver: &'a dyn context::DecisionResolver,
     pub predictor: Option<&'a dyn RoutePredictor>,
     /// Managed dispatch (SPEC §23): every launch is admitted, heartbeat
     /// and settled through this gate. `None` = unmanaged execution;

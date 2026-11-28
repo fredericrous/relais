@@ -6,8 +6,8 @@
 //! necessary constraints, a small set of entry points and exact failure
 //! evidence — large files and logs are referenced by path and range.
 //! Required constraints that exceed the context budget are a sizing
-//! problem, never silently truncated. aval verdicts (active, undecided,
-//! contradiction, retired, unknown) and aval tool failures stay distinct;
+//! problem, never silently truncated. greentopo verdicts (active, undecided,
+//! contradiction, retired, unknown) and greentopo tool failures stay distinct;
 //! only a contradiction blocks affected work, and a missing answer gates
 //! only tasks that depend on it.
 
@@ -30,7 +30,7 @@ pub use guidance::{
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AvalVerdict {
+pub enum GreentopoVerdict {
     Active {
         adr: String,
         /// What was decided, in the record's words — the constraint the
@@ -56,7 +56,7 @@ pub enum AvalVerdict {
     /// No `greentopo` anywhere on PATH, confirmed before the spawn. Not a
     /// verdict and not a pass: the key was not checked (ADR-0047).
     NotInstalled,
-    /// Exit 1/2/3 from aval: a tool or corpus failure, NOT a verdict.
+    /// Exit 1/2/3 from greentopo: a tool or corpus failure, NOT a verdict.
     /// Kept distinct so a broken corpus can never read as a decision
     /// (SPEC §7).
     ToolFailure {
@@ -82,11 +82,11 @@ fn string_field(entry: &serde_json::Value, field: &str) -> Option<String> {
 /// Parse `greentopo resolve <key> --json` output (SEMANTICS.md v1.2.0 is the
 /// normative contract): the payload carries `state` and `exit`; an error
 /// envelope is `{"ok": false, "exit": N, "error": "..."}`.
-pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
+pub fn parse_greentopo_output(exit_code: i32, stdout: &str) -> GreentopoVerdict {
     let value: serde_json::Value = match serde_json::from_str(stdout.trim()) {
         Ok(value) => value,
         Err(_) => {
-            return AvalVerdict::ToolFailure {
+            return GreentopoVerdict::ToolFailure {
                 exit: exit_code,
                 detail: format!("unparseable greentopo output: {stdout:?}"),
             }
@@ -102,10 +102,10 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
             .get("exit")
             .and_then(|e| e.as_i64())
             .unwrap_or(exit_code as i64) as i32;
-        return AvalVerdict::ToolFailure { exit, detail };
+        return GreentopoVerdict::ToolFailure { exit, detail };
     }
     match value.get("state").and_then(|s| s.as_str()) {
-        Some("active") => AvalVerdict::Active {
+        Some("active") => GreentopoVerdict::Active {
             adr: value
                 .get("adr")
                 .and_then(|a| a.as_str())
@@ -120,8 +120,8 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
                 .and_then(|r| r.as_str())
                 .map(str::to_string),
         },
-        Some("undecided") => AvalVerdict::Undecided,
-        Some("contradiction") => AvalVerdict::Contradiction {
+        Some("undecided") => GreentopoVerdict::Undecided,
+        Some("contradiction") => GreentopoVerdict::Contradiction {
             heads: value
                 .get("heads")
                 .and_then(|heads| heads.as_array())
@@ -147,22 +147,22 @@ pub fn parse_aval_output(exit_code: i32, stdout: &str) -> AvalVerdict {
                 })
                 .unwrap_or_default(),
         },
-        Some("retired") => AvalVerdict::Retired {
+        Some("retired") => GreentopoVerdict::Retired {
             adr: value
                 .get("adr")
                 .and_then(|a| a.as_str())
                 .unwrap_or("?")
                 .to_string(),
         },
-        Some("unknown") => AvalVerdict::Unknown,
-        other => AvalVerdict::ToolFailure {
+        Some("unknown") => GreentopoVerdict::Unknown,
+        other => GreentopoVerdict::ToolFailure {
             exit: exit_code,
             detail: format!("greentopo emitted an unrecognized state: {other:?}"),
         },
     }
 }
 
-/// Who disagrees: each scope with its ADR when aval named the scopes,
+/// Who disagrees: each scope with its ADR when greentopo named the scopes,
 /// else the head ADR ids.
 pub fn contradiction_detail(heads: &[String], by_scope: &[ScopedHead]) -> String {
     if !by_scope.is_empty() {
@@ -184,7 +184,7 @@ pub fn contradiction_detail(heads: &[String], by_scope: &[ScopedHead]) -> String
 /// tool would cost nobody a change of import (boundaries.own-the-interface).
 pub trait DecisionResolver {
     /// Resolve one decision key, optionally within a scope.
-    fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict;
+    fn resolve(&self, key: &str, scope: Option<&str>) -> GreentopoVerdict;
 
     /// The active constraint rules, for the index and the reviewer. A
     /// failure is a gap, never a verdict: guidance does not block a run.
@@ -194,7 +194,7 @@ pub trait DecisionResolver {
         Ok(Rules::default())
     }
 
-    /// aval's advisory ranking for a query. Same failure policy.
+    /// greentopo's advisory ranking for a query. Same failure policy.
     fn relevant(&self, _query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
         Ok(Relevant::default())
     }
@@ -219,21 +219,21 @@ pub trait DecisionResolver {
 /// A closure is a resolver: the shape tests and the CLI both already use.
 impl<F> DecisionResolver for F
 where
-    F: Fn(&str, Option<&str>) -> AvalVerdict,
+    F: Fn(&str, Option<&str>) -> GreentopoVerdict,
 {
-    fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
+    fn resolve(&self, key: &str, scope: Option<&str>) -> GreentopoVerdict {
         self(key, scope)
     }
 }
 
 /// The `greentopo` binary on this machine — the one place it is spawned.
-pub struct AvalCli {
+pub struct GreentopoCli {
     root: PathBuf,
     /// The `[integrations] greentopo` `bin` override, when one is declared.
     bin: Option<String>,
     cancel: Option<Arc<AtomicBool>>,
     /// The constraint index is the same for every package of a run, so it
-    /// is fetched once per `AvalCli` (one per run) and shared.
+    /// is fetched once per `GreentopoCli` (one per run) and shared.
     rules: OnceLock<Result<Rules, GuidanceGap>>,
     /// The greenspotter program: `RELAIS_GREENSPOTTER`, else `greenspotter` from PATH.
     greenspotter: String,
@@ -245,7 +245,7 @@ pub struct AvalCli {
     fleet_cache: Option<PathBuf>,
 }
 
-impl AvalCli {
+impl GreentopoCli {
     /// The declared `bin`, else the key's binary, `greentopo`.
     fn program(&self) -> &str {
         self.bin
@@ -371,9 +371,9 @@ fn greenspotter_program() -> String {
         .unwrap_or_else(|| "greenspotter".to_string())
 }
 
-impl DecisionResolver for AvalCli {
-    fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
-        aval_resolve_in(
+impl DecisionResolver for GreentopoCli {
+    fn resolve(&self, key: &str, scope: Option<&str>) -> GreentopoVerdict {
+        greentopo_resolve_in(
             &self.root,
             key,
             scope,
@@ -391,7 +391,7 @@ impl DecisionResolver for AvalCli {
                     let dir = dir.to_path_buf();
                     let program = program.clone();
                     move |args: &[String]| {
-                        guidance::run_aval(
+                        guidance::run_greentopo(
                             &program,
                             args,
                             &dir,
@@ -419,7 +419,9 @@ impl DecisionResolver for AvalCli {
                 let in_fleet = fleet_dir.as_deref().map(ask_in);
                 guidance::fetch_rules_or_fleet(
                     &in_repository,
-                    in_fleet.as_ref().map(|ask| ask as guidance::AvalRun<'_>),
+                    in_fleet
+                        .as_ref()
+                        .map(|ask| ask as guidance::GreentopoRun<'_>),
                 )
                 .map_err(|gap| match cache_failure {
                     Some(failure) if gap.cause == guidance::GapCause::Exited(3) => {
@@ -436,7 +438,7 @@ impl DecisionResolver for AvalCli {
     }
 
     fn relevant(&self, query: &RelevantQuery) -> Result<Relevant, GuidanceGap> {
-        guidance::run_aval(
+        guidance::run_greentopo(
             self.program(),
             &guidance::relevant_args(query),
             &self.root,
@@ -450,7 +452,7 @@ impl DecisionResolver for AvalCli {
     fn decisions_for(&self, paths: &[String]) -> Result<Vec<RankedKey>, GuidanceGap> {
         guidance::fetch_decisions(
             &|args| {
-                guidance::run_aval(
+                guidance::run_greentopo(
                     self.program(),
                     args,
                     &self.root,
@@ -479,19 +481,19 @@ impl DecisionResolver for AvalCli {
 }
 
 /// Invoke `greentopo resolve KEY --json` in a repository. The exit-code contract
-/// is part of aval's stable interface: 0 active, 4 undecided,
+/// is part of greentopo's stable interface: 0 active, 4 undecided,
 /// 5 contradiction, 6 retired, 7 unknown, 1/2/3 tool or corpus failure.
 ///
 /// Bounded and cancellable: a corpus tool that never answers is a tool
 /// failure, not a run that waits out its wall clock (audit V6).
-pub fn aval_resolve(
+pub fn greentopo_resolve(
     repo_dir: &Path,
     key: &str,
     scope: Option<&str>,
     bin: Option<&str>,
     cancel: Option<&AtomicBool>,
-) -> AvalVerdict {
-    aval_resolve_in(
+) -> GreentopoVerdict {
+    greentopo_resolve_in(
         repo_dir,
         key,
         scope,
@@ -501,22 +503,22 @@ pub fn aval_resolve(
     )
 }
 
-/// [`aval_resolve`] with the search path given, so a test controls it
+/// [`greentopo_resolve`] with the search path given, so a test controls it
 /// without touching the process environment. The spawned command sees the
 /// same path the lookup used.
-pub fn aval_resolve_in(
+pub fn greentopo_resolve_in(
     repo_dir: &Path,
     key: &str,
     scope: Option<&str>,
     bin: Option<&str>,
     path: std::ffi::OsString,
     cancel: Option<&AtomicBool>,
-) -> AvalVerdict {
-    // aval takes no `--` separator, so a key that looks like a flag would
+) -> GreentopoVerdict {
+    // greentopo takes no `--` separator, so a key that looks like a flag would
     // be parsed as one. Such a key is a mapping error, reported as the
     // tool failure it would otherwise become in a less legible form.
     if key.starts_with('-') || key.trim().is_empty() {
-        return AvalVerdict::ToolFailure {
+        return GreentopoVerdict::ToolFailure {
             exit: 2,
             detail: format!("decision key `{key}` is not a key greentopo can be asked for"),
         };
@@ -526,7 +528,7 @@ pub fn aval_resolve_in(
     // missing program, and the launch hint would then point at the wrong
     // cause.
     if !repo_dir.is_dir() {
-        return AvalVerdict::ToolFailure {
+        return GreentopoVerdict::ToolFailure {
             exit: -1,
             detail: format!(
                 "greentopo cannot run in {}: it is not a directory or does not exist",
@@ -563,8 +565,8 @@ pub fn aval_resolve_in(
     }
     match crate::procs::run_with_timeout(command, crate::tooling::PROBE_TIMEOUT, None, cancel) {
         Ok(end) => match end.ended {
-            crate::procs::Ended::Exited(code) => parse_aval_output(code, &end.stdout),
-            other => AvalVerdict::ToolFailure {
+            crate::procs::Ended::Exited(code) => parse_greentopo_output(code, &end.stdout),
+            other => GreentopoVerdict::ToolFailure {
                 exit: -1,
                 detail: format!(
                     "greentopo (`{program}`) did not answer: {}",
@@ -575,13 +577,13 @@ pub fn aval_resolve_in(
         Err(crate::procs::RunError::Spawn(e))
             if confirmed_absent && e.kind() == std::io::ErrorKind::NotFound =>
         {
-            AvalVerdict::NotInstalled
+            GreentopoVerdict::NotInstalled
         }
-        Err(e) => AvalVerdict::ToolFailure {
+        Err(e) => GreentopoVerdict::ToolFailure {
             exit: -1,
             detail: format!(
                 "greentopo (`{program}`) could not be launched: {e}; {}",
-                aval_launch_hint(program, bin)
+                greentopo_launch_hint(program, bin)
             ),
         },
     }
@@ -590,7 +592,7 @@ pub fn aval_resolve_in(
 /// What to check when greentopo could not be launched, by where the
 /// program came from: a declared `bin` plays PATH no part; otherwise
 /// `greentopo` was found on PATH in some form and did not start.
-fn aval_launch_hint(program: &str, declared_bin: Option<&str>) -> String {
+fn greentopo_launch_hint(program: &str, declared_bin: Option<&str>) -> String {
     match declared_bin {
         Some(declared) => format!(
             "check that `{declared}`, the `bin` declared under [integrations] in relais.toml, exists and runs"
@@ -606,7 +608,7 @@ fn aval_launch_hint(program: &str, declared_bin: Option<&str>) -> String {
 /// could touch. Unlisted keys never block unrelated work (SPEC §7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArchitectureEvidence {
-    pub resolved: Vec<(String, AvalVerdict)>,
+    pub resolved: Vec<(String, GreentopoVerdict)>,
 }
 
 /// Why a context package could not be assembled. Sizing is a distinct
@@ -625,10 +627,10 @@ pub enum ContextError {
         heads: Vec<String>,
         by_scope: Vec<ScopedHead>,
     },
-    /// The task depends on a key aval cannot currently answer.
+    /// The task depends on a key greentopo cannot currently answer.
     NeedsDecision {
         key: String,
-        verdict: AvalVerdict,
+        verdict: GreentopoVerdict,
     },
     ToolFailure {
         key: String,
@@ -942,7 +944,7 @@ pub fn read_design_file(path: &Path) -> Result<DesignInput, DesignError> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolVersions {
     pub relais: String,
-    pub aval: Option<String>,
+    pub greentopo: Option<String>,
     pub amont: Option<String>,
     #[serde(default)]
     pub claude_code: Option<String>,
@@ -997,7 +999,7 @@ pub struct ContextManifest {
     #[serde(default)]
     pub env_protection: String,
     /// Advisory guidance (SPEC §7): the constraint index, the full
-    /// statements, aval's ranking and every gap. Evidence only; it is not
+    /// statements, greentopo's ranking and every gap. Evidence only; it is not
     /// compared and never counts toward `package_bytes`.
     #[serde(default)]
     pub guidance: Guidance,
@@ -1015,7 +1017,7 @@ pub struct ContextManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holdouts: Vec<crate::holdout::HoldoutRecord>,
     /// Decision keys the task depends on that were not checked because
-    /// aval is not installed and not required (ADR-0047). Reported through
+    /// greentopo is not installed and not required (ADR-0047). Reported through
     /// a guidance gap; never read as resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unchecked_keys: Vec<String>,
@@ -1073,7 +1075,7 @@ pub struct ContextInputs<'a> {
     /// ([`read_design`]); `None` when the contract names none.
     pub design: Option<DesignInput>,
     /// The directory name of the source repository's root (never a task
-    /// worktree's directory), as aval's corpus names the repository.
+    /// worktree's directory), as greentopo's corpus names the repository.
     pub repo_name: Option<String>,
     /// Holdouts resolved at preflight; recorded in the manifest.
     pub holdouts: Vec<crate::holdout::HoldoutRecord>,
@@ -1099,7 +1101,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
         holdouts,
     } = inputs;
 
-    let manifest_aval_version = tool_versions.aval.clone();
+    let manifest_greentopo_version = tool_versions.greentopo.clone();
     let mut keys: Vec<String> = contract.architecture.keys.clone();
     for mapping in &repo.architecture.mapping {
         let touched = contract
@@ -1113,26 +1115,28 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
     keys.sort();
     keys.dedup();
 
-    let aval_mode = repo.integrations.greentopo.as_ref().map(|d| d.mode());
+    let greentopo_mode = repo.integrations.greentopo.as_ref().map(|d| d.mode());
     let mut unchecked_keys: Vec<String> = Vec::new();
     let mut resolved = Vec::new();
     for key in &keys {
         let verdict = resolver.resolve(key, contract.architecture.scope.as_deref());
         match &verdict {
-            AvalVerdict::Contradiction { heads, by_scope } => {
+            GreentopoVerdict::Contradiction { heads, by_scope } => {
                 return Err(ContextError::ContradictionBlocked {
                     key: key.clone(),
                     heads: heads.clone(),
                     by_scope: by_scope.clone(),
                 })
             }
-            AvalVerdict::Undecided | AvalVerdict::Unknown | AvalVerdict::Retired { .. } => {
+            GreentopoVerdict::Undecided
+            | GreentopoVerdict::Unknown
+            | GreentopoVerdict::Retired { .. } => {
                 return Err(ContextError::NeedsDecision {
                     key: key.clone(),
                     verdict: verdict.clone(),
                 })
             }
-            AvalVerdict::ToolFailure { detail, .. } => {
+            GreentopoVerdict::ToolFailure { detail, .. } => {
                 return Err(ContextError::ToolFailure {
                     key: key.clone(),
                     detail: detail.clone(),
@@ -1140,19 +1144,19 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
             }
             // Confirmed absent and not required: the key is reported as
             // unchecked, never as resolved (ADR-0047).
-            AvalVerdict::NotInstalled
-                if matches!(aval_mode, None | Some(DependencyMode::Optional)) =>
+            GreentopoVerdict::NotInstalled
+                if matches!(greentopo_mode, None | Some(DependencyMode::Optional)) =>
             {
                 unchecked_keys.push(key.clone());
                 continue;
             }
-            AvalVerdict::NotInstalled => {
+            GreentopoVerdict::NotInstalled => {
                 return Err(ContextError::ToolFailure {
                     key: key.clone(),
                     detail: "greentopo is not installed".to_string(),
                 })
             }
-            AvalVerdict::Active { .. } => {}
+            GreentopoVerdict::Active { .. } => {}
         }
         resolved.push((key.clone(), verdict));
     }
@@ -1164,7 +1168,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
             text: contract.objective.clone(),
         },
         &keys,
-        manifest_aval_version,
+        manifest_greentopo_version,
     );
     guidance.repo_name = repo_name;
     if !unchecked_keys.is_empty() {
@@ -1181,7 +1185,7 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
     let constraints: Vec<String> = resolved
         .iter()
         .filter_map(|(key, verdict)| match verdict {
-            AvalVerdict::Active {
+            GreentopoVerdict::Active {
                 adr,
                 choice,
                 reason,
@@ -1197,12 +1201,12 @@ pub fn assemble(inputs: ContextInputs<'_>) -> Result<ContextManifest, ContextErr
             // Only an Active verdict carries a constraint: Undecided and
             // Unknown decide nothing, Retired decides nothing any more,
             // and Contradiction/ToolFailure were already refused above.
-            AvalVerdict::Undecided
-            | AvalVerdict::Unknown
-            | AvalVerdict::Retired { .. }
-            | AvalVerdict::Contradiction { .. }
-            | AvalVerdict::NotInstalled
-            | AvalVerdict::ToolFailure { .. } => None,
+            GreentopoVerdict::Undecided
+            | GreentopoVerdict::Unknown
+            | GreentopoVerdict::Retired { .. }
+            | GreentopoVerdict::Contradiction { .. }
+            | GreentopoVerdict::NotInstalled
+            | GreentopoVerdict::ToolFailure { .. } => None,
         })
         .collect();
 
@@ -1272,13 +1276,13 @@ pub fn gather_guidance(
     resolver: &dyn DecisionResolver,
     query: &RelevantQuery,
     binding_keys: &[String],
-    aval_version: Option<String>,
+    greentopo_version: Option<String>,
 ) -> Guidance {
     let mut guidance = Guidance {
-        aval_version,
+        greentopo_version,
         ..Guidance::default()
     };
-    let mut aval_missing = false;
+    let mut greentopo_missing = false;
     match resolver.constraint_rules() {
         Ok(rules) => {
             guidance.index = rules
@@ -1293,13 +1297,13 @@ pub fn gather_guidance(
             guidance.gaps.extend(rules.notes);
         }
         Err(gap) => {
-            aval_missing = gap.is_not_launched();
+            greentopo_missing = gap.is_not_launched();
             guidance.record(gap);
         }
     }
-    // An aval that will not launch fails the second question the same
+    // A greentopo that will not launch fails the second question the same
     // way: one gap, not two.
-    if !aval_missing {
+    if !greentopo_missing {
         match resolver.relevant(query) {
             Ok(relevant) => {
                 guidance.relevant_keys = relevant
@@ -1387,7 +1391,7 @@ mod tests {
             },
             tool_versions: ToolVersions {
                 relais: "0.1.0".into(),
-                aval: Some("1.3.2".into()),
+                greentopo: Some("1.3.2".into()),
                 amont: Some("1.36.0".into()),
                 claude_code: None,
             },
@@ -1399,9 +1403,9 @@ mod tests {
         }
     }
 
-    fn active(key: &str, _scope: Option<&str>) -> AvalVerdict {
+    fn active(key: &str, _scope: Option<&str>) -> GreentopoVerdict {
         let _ = key;
-        AvalVerdict::Active {
+        GreentopoVerdict::Active {
             adr: "ADR-0021".into(),
             choice: None,
             reason: None,
@@ -1409,61 +1413,61 @@ mod tests {
     }
 
     #[test]
-    fn parses_each_verdict_state_from_aval_json() {
+    fn parses_each_verdict_state_from_greentopo_json() {
         assert_eq!(
-            parse_aval_output(
+            parse_greentopo_output(
                 0,
                 r#"{"state":"active","exit":0,"key":"storage.object-store","adr":"ADR-0021",
                     "choice":"RGW behind Ceph","reason":"one storage plane"}"#
             ),
-            AvalVerdict::Active {
+            GreentopoVerdict::Active {
                 adr: "ADR-0021".into(),
                 choice: Some("RGW behind Ceph".into()),
                 reason: Some("one storage plane".into()),
             }
         );
         assert_eq!(
-            parse_aval_output(4, r#"{"state":"undecided","exit":4,"key":"k"}"#),
-            AvalVerdict::Undecided
+            parse_greentopo_output(4, r#"{"state":"undecided","exit":4,"key":"k"}"#),
+            GreentopoVerdict::Undecided
         );
         assert_eq!(
-            parse_aval_output(
+            parse_greentopo_output(
                 5,
                 r#"{"state":"contradiction","exit":5,"heads":[{"adr":"ADR-0001"},{"adr":"ADR-0002"}]}"#
             ),
-            AvalVerdict::Contradiction {
+            GreentopoVerdict::Contradiction {
                 heads: vec!["ADR-0001".into(), "ADR-0002".into()],
                 by_scope: Vec::new(),
             }
         );
         assert_eq!(
-            parse_aval_output(6, r#"{"state":"retired","exit":6,"adr":"ADR-0002"}"#),
-            AvalVerdict::Retired {
+            parse_greentopo_output(6, r#"{"state":"retired","exit":6,"adr":"ADR-0002"}"#),
+            GreentopoVerdict::Retired {
                 adr: "ADR-0002".into()
             }
         );
         assert_eq!(
-            parse_aval_output(7, r#"{"state":"unknown","exit":7,"key":"k"}"#),
-            AvalVerdict::Unknown
+            parse_greentopo_output(7, r#"{"state":"unknown","exit":7,"key":"k"}"#),
+            GreentopoVerdict::Unknown
         );
     }
 
     #[test]
     fn tool_failures_stay_distinct_from_verdicts() {
         assert_eq!(
-            parse_aval_output(3, r#"{"ok":false,"exit":3,"error":"unreadable corpus"}"#),
-            AvalVerdict::ToolFailure {
+            parse_greentopo_output(3, r#"{"ok":false,"exit":3,"error":"unreadable corpus"}"#),
+            GreentopoVerdict::ToolFailure {
                 exit: 3,
                 detail: "unreadable corpus".into()
             }
         );
         assert!(matches!(
-            parse_aval_output(1, "not json at all"),
-            AvalVerdict::ToolFailure { .. }
+            parse_greentopo_output(1, "not json at all"),
+            GreentopoVerdict::ToolFailure { .. }
         ));
-        let verdict = parse_aval_output(0, r#"{"state":"weird"}"#);
+        let verdict = parse_greentopo_output(0, r#"{"state":"weird"}"#);
         assert!(
-            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            matches!(verdict, GreentopoVerdict::ToolFailure { .. }),
             "{verdict:?}"
         );
     }
@@ -1485,7 +1489,7 @@ mod tests {
     fn contradiction_blocks_affected_work() {
         let c = contract(&["api.gateway"]);
         let r = repo();
-        let contradiction = |_: &str, _: Option<&str>| AvalVerdict::Contradiction {
+        let contradiction = |_: &str, _: Option<&str>| GreentopoVerdict::Contradiction {
             heads: vec!["ADR-0001".into(), "ADR-0002".into()],
             by_scope: Vec::new(),
         };
@@ -1502,16 +1506,16 @@ mod tests {
 
     #[test]
     fn a_cross_scope_contradiction_names_each_scope_and_adr() {
-        let two_adrs = parse_aval_output(
+        let two_adrs = parse_greentopo_output(
             5,
             r#"{"state":"contradiction","exit":5,"matched_scope":null,"heads":[{"adr":"ADR-0010"},{"adr":"ADR-0020"}],"by_scope":[{"scope":"duro-stack","adr":"ADR-0010"},{"scope":"*","adr":"ADR-0020"}]}"#,
         );
-        let one_adr = parse_aval_output(
+        let one_adr = parse_greentopo_output(
             5,
             r#"{"state":"contradiction","exit":5,"matched_scope":null,"heads":[{"adr":"ADR-0010"}],"by_scope":[{"scope":"duro-stack","adr":"ADR-0010"},{"scope":"*","adr":"ADR-0010"}]}"#,
         );
         for verdict in [two_adrs, one_adr] {
-            let AvalVerdict::Contradiction { heads, by_scope } = verdict else {
+            let GreentopoVerdict::Contradiction { heads, by_scope } = verdict else {
                 panic!("expected a contradiction");
             };
             let message = ContextError::ContradictionBlocked {
@@ -1543,7 +1547,7 @@ mod tests {
         let c = contract(&[]);
         let r = repo();
         // No keys: an unrelated undecided key cannot block anything.
-        let undecided = |_: &str, _: Option<&str>| AvalVerdict::Undecided;
+        let undecided = |_: &str, _: Option<&str>| GreentopoVerdict::Undecided;
         assemble(inputs(&c, &r, &undecided)).expect("no keys means no dependency");
 
         let dependent = contract(&["api.gateway"]);
@@ -1555,7 +1559,7 @@ mod tests {
     fn tool_failure_is_not_a_verdict() {
         let c = contract(&["k"]);
         let r = repo();
-        let broken = |_: &str, _: Option<&str>| AvalVerdict::ToolFailure {
+        let broken = |_: &str, _: Option<&str>| GreentopoVerdict::ToolFailure {
             exit: 3,
             detail: "unreadable".into(),
         };
@@ -1563,19 +1567,19 @@ mod tests {
         assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
     }
 
-    fn repo_with_aval(mode: Option<crate::policy::DependencyMode>) -> RepoPolicy {
+    fn repo_with_greentopo(mode: Option<crate::policy::DependencyMode>) -> RepoPolicy {
         let mut r = repo();
         r.integrations.greentopo = mode.map(crate::policy::Dependency::Mode);
         r
     }
 
-    fn not_installed(_: &str, _: Option<&str>) -> AvalVerdict {
-        AvalVerdict::NotInstalled
+    fn not_installed(_: &str, _: Option<&str>) -> GreentopoVerdict {
+        GreentopoVerdict::NotInstalled
     }
 
     fn assert_unchecked(keys: &[&str], mode: Option<crate::policy::DependencyMode>) -> String {
         let c = contract(keys);
-        let r = repo_with_aval(mode);
+        let r = repo_with_greentopo(mode);
         let manifest = assemble(inputs(&c, &r, &not_installed)).expect("absence does not block");
         assert_eq!(
             manifest.unchecked_keys,
@@ -1593,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn not_installed_with_optional_aval_reports_the_key_unchecked() {
+    fn not_installed_with_optional_greentopo_reports_the_key_unchecked() {
         let described = assert_unchecked(&["k"], Some(crate::policy::DependencyMode::Optional));
         assert_eq!(
             described,
@@ -1602,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn not_installed_with_aval_unset_reports_the_key_unchecked() {
+    fn not_installed_with_greentopo_unset_reports_the_key_unchecked() {
         let described = assert_unchecked(&["k"], None);
         assert_eq!(
             described,
@@ -1611,26 +1615,26 @@ mod tests {
     }
 
     #[test]
-    fn not_installed_with_required_aval_blocks() {
+    fn not_installed_with_required_greentopo_blocks() {
         let c = contract(&["k"]);
-        let r = repo_with_aval(Some(crate::policy::DependencyMode::Required));
+        let r = repo_with_greentopo(Some(crate::policy::DependencyMode::Required));
         let err = assemble(inputs(&c, &r, &not_installed)).unwrap_err();
         assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
     }
 
     #[test]
-    fn not_installed_with_aval_off_blocks() {
+    fn not_installed_with_greentopo_off_blocks() {
         let c = contract(&["k"]);
-        let r = repo_with_aval(Some(crate::policy::DependencyMode::Off));
+        let r = repo_with_greentopo(Some(crate::policy::DependencyMode::Off));
         let err = assemble(inputs(&c, &r, &not_installed)).unwrap_err();
         assert!(matches!(err, ContextError::ToolFailure { .. }), "{err:?}");
     }
 
     #[test]
-    fn tool_failure_blocks_even_with_optional_aval() {
+    fn tool_failure_blocks_even_with_optional_greentopo() {
         let c = contract(&["k"]);
-        let r = repo_with_aval(Some(crate::policy::DependencyMode::Optional));
-        let broken = |_: &str, _: Option<&str>| AvalVerdict::ToolFailure {
+        let r = repo_with_greentopo(Some(crate::policy::DependencyMode::Optional));
+        let broken = |_: &str, _: Option<&str>| GreentopoVerdict::ToolFailure {
             exit: 3,
             detail: "unreadable".into(),
         };
@@ -1650,8 +1654,8 @@ mod tests {
         );
     }
 
-    fn resolve_with_path(repo_dir: &Path, bin: Option<&str>, path_dir: &Path) -> AvalVerdict {
-        aval_resolve_in(
+    fn resolve_with_path(repo_dir: &Path, bin: Option<&str>, path_dir: &Path) -> GreentopoVerdict {
+        greentopo_resolve_in(
             repo_dir,
             "k",
             None,
@@ -1663,30 +1667,30 @@ mod tests {
 
     #[test]
     fn an_empty_path_with_no_declared_bin_is_not_installed() {
-        let dir = crate::test_support::temp_dir("aval-absent");
+        let dir = crate::test_support::temp_dir("greentopo-absent");
         assert_eq!(
             resolve_with_path(&dir, None, &dir),
-            AvalVerdict::NotInstalled
+            GreentopoVerdict::NotInstalled
         );
     }
 
-    // Unix only: the fake aval is a `sh` script made executable by mode.
+    // Unix only: the fake greentopo is a `sh` script made executable by mode.
     #[cfg(unix)]
     #[test]
     fn a_repository_without_a_corpus_takes_the_embedded_fleet_pack_by_default() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = crate::test_support::temp_dir("aval-fleet");
+        let dir = crate::test_support::temp_dir("greentopo-fleet");
         let repository = dir.join("repository");
         let cache = dir.join("cache");
         std::fs::create_dir_all(&repository).expect("repository");
-        let fake = dir.join("fake-aval");
+        let fake = dir.join("fake-greentopo");
         let script = "#!/bin/sh\nif [ -f .adr.yaml ] && grep -q decisions.pack .adr.yaml && [ -s decisions.pack ]; then\n  printf '%s' '{\"rules\":[{\"active\":true,\"adopts\":\"ADR-0011\",\"body\":\"B\",\"file\":\"aval.pack\",\"governs\":\"code\",\"id\":\"names.reveal-intent\",\"level\":\"constraint\",\"pack\":\"decisions\",\"source\":\"x\",\"statement\":\"S\"}]}'\nelse\n  exit 3\nfi\n";
-        std::fs::write(&fake, script).expect("fake aval");
+        std::fs::write(&fake, script).expect("fake greentopo");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         // Its first exec on macOS is assessed, past the 5 s guidance
         // timeout under load: run it once before anything is timed.
         crate::test_support::prime_script(&fake);
-        let mut cli = AvalCli::new(repository)
+        let mut cli = GreentopoCli::new(repository)
             .with_bin(fake.to_str())
             .with_fleet_cache(cache.clone());
         cli.fleet_decisions = None;
@@ -1724,9 +1728,11 @@ mod tests {
             .output()
         {
             Ok(output) => output,
-            // no greentopo installed here: the fake-aval tests still cover the wiring
+            // no greentopo installed here: the fake-greentopo tests still cover the wiring
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("skipped: no greentopo on PATH; the fake-aval tests cover the wiring");
+                eprintln!(
+                    "skipped: no greentopo on PATH; the fake-greentopo tests cover the wiring"
+                );
                 return;
             }
             Err(error) => panic!("greentopo did not run: {error}"),
@@ -1739,10 +1745,10 @@ mod tests {
 
     #[test]
     fn a_declared_bin_that_does_not_exist_is_a_tool_failure() {
-        let dir = crate::test_support::temp_dir("aval-bin");
-        let verdict = resolve_with_path(&dir, Some("/nonexistent/aval"), &dir);
+        let dir = crate::test_support::temp_dir("greentopo-bin");
+        let verdict = resolve_with_path(&dir, Some("/nonexistent/greentopo"), &dir);
         assert!(
-            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            matches!(verdict, GreentopoVerdict::ToolFailure { .. }),
             "{verdict:?}"
         );
     }
@@ -1751,15 +1757,15 @@ mod tests {
     /// never at PATH, which plays no part in it.
     #[test]
     fn a_declared_bin_launch_failure_names_the_declaration_not_path() {
-        let dir = crate::test_support::temp_dir("aval-bin-hint");
-        let AvalVerdict::ToolFailure { detail, .. } =
-            resolve_with_path(&dir, Some("/nonexistent/aval"), &dir)
+        let dir = crate::test_support::temp_dir("greentopo-bin-hint");
+        let GreentopoVerdict::ToolFailure { detail, .. } =
+            resolve_with_path(&dir, Some("/nonexistent/greentopo"), &dir)
         else {
             panic!("a declared bin that does not exist is a tool failure");
         };
         assert!(
             detail.ends_with(
-                "check that `/nonexistent/aval`, the `bin` declared under [integrations] in relais.toml, exists and runs"
+                "check that `/nonexistent/greentopo`, the `bin` declared under [integrations] in relais.toml, exists and runs"
             ),
             "{detail}"
         );
@@ -1769,11 +1775,11 @@ mod tests {
     #[test]
     fn the_launch_hint_follows_where_the_program_came_from() {
         assert_eq!(
-            aval_launch_hint("/opt/bin/greentopo", Some("/opt/bin/greentopo")),
+            greentopo_launch_hint("/opt/bin/greentopo", Some("/opt/bin/greentopo")),
             "check that `/opt/bin/greentopo`, the `bin` declared under [integrations] in relais.toml, exists and runs"
         );
         assert_eq!(
-            aval_launch_hint("greentopo", None),
+            greentopo_launch_hint("greentopo", None),
             "check that `greentopo` on PATH runs, or set `bin` under [integrations] in relais.toml"
         );
     }
@@ -1782,7 +1788,7 @@ mod tests {
     #[test]
     fn a_greentopo_only_path_is_not_confirmed_absent() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = crate::test_support::temp_dir("aval-greentopo-only");
+        let dir = crate::test_support::temp_dir("greentopo-only");
         let greentopo = dir.join("greentopo");
         std::fs::write(&greentopo, "#!/bin/sh\nexit 3\n").expect("write");
         std::fs::set_permissions(&greentopo, std::fs::Permissions::from_mode(0o755))
@@ -1792,10 +1798,10 @@ mod tests {
         // exit 3 from the fake greentopo: it was the program spawned, and
         // its absence was not confirmed.
         assert!(
-            !matches!(verdict, AvalVerdict::NotInstalled),
+            !matches!(verdict, GreentopoVerdict::NotInstalled),
             "greentopo is installed, so its absence is not confirmed: {verdict:?}"
         );
-        assert_eq!(verdict, parse_aval_output(3, ""), "{verdict:?}");
+        assert_eq!(verdict, parse_greentopo_output(3, ""), "{verdict:?}");
     }
 
     /// The old `aval` binary is never spawned: with only it on PATH,
@@ -1811,7 +1817,7 @@ mod tests {
         crate::test_support::prime_script(&fake);
         assert_eq!(
             resolve_with_path(&dir, None, &dir),
-            AvalVerdict::NotInstalled
+            GreentopoVerdict::NotInstalled
         );
     }
 
@@ -1820,10 +1826,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_dangling_greentopo_is_a_tool_failure_not_absence() {
-        let dir = crate::test_support::temp_dir("aval-dangling-greentopo");
+        let dir = crate::test_support::temp_dir("greentopo-dangling");
         std::os::unix::fs::symlink(dir.join("gone"), dir.join("greentopo")).expect("link");
         let verdict = resolve_with_path(&dir, None, &dir);
-        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+        let GreentopoVerdict::ToolFailure { detail, .. } = verdict else {
             panic!("expected a tool failure, got {verdict:?}");
         };
         assert!(
@@ -1836,10 +1842,10 @@ mod tests {
 
     #[test]
     fn a_missing_repo_dir_is_a_tool_failure_not_absence() {
-        let dir = crate::test_support::temp_dir("aval-nodir");
+        let dir = crate::test_support::temp_dir("greentopo-nodir");
         let missing = dir.join("missing");
         let verdict = resolve_with_path(&missing, None, &dir);
-        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+        let GreentopoVerdict::ToolFailure { detail, .. } = verdict else {
             panic!("expected a tool failure, got {verdict:?}");
         };
         assert!(detail.contains(&missing.display().to_string()), "{detail}");
@@ -1850,11 +1856,11 @@ mod tests {
 
     #[test]
     fn a_file_repo_dir_is_a_tool_failure_naming_it() {
-        let dir = crate::test_support::temp_dir("aval-filedir");
+        let dir = crate::test_support::temp_dir("greentopo-filedir");
         let file = dir.join("not-a-dir");
         std::fs::write(&file, "").expect("write");
         let verdict = resolve_with_path(&file, None, &dir);
-        let AvalVerdict::ToolFailure { detail, .. } = verdict else {
+        let GreentopoVerdict::ToolFailure { detail, .. } = verdict else {
             panic!("expected a tool failure, got {verdict:?}");
         };
         assert!(detail.contains(&file.display().to_string()), "{detail}");
@@ -1871,7 +1877,7 @@ mod tests {
         std::fs::set_permissions(&topo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let verdict = resolve_with_path(&dir, None, &dir);
         assert!(
-            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            matches!(verdict, GreentopoVerdict::ToolFailure { .. }),
             "{verdict:?}"
         );
     }
@@ -1886,7 +1892,7 @@ mod tests {
         std::fs::set_permissions(&topo, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let verdict = resolve_with_path(&dir, None, &dir);
         assert!(
-            matches!(verdict, AvalVerdict::ToolFailure { .. }),
+            matches!(verdict, GreentopoVerdict::ToolFailure { .. }),
             "{verdict:?}"
         );
     }
@@ -1933,7 +1939,7 @@ mod tests {
                 scope: None,
             }],
         };
-        let big = |_: &str, _: Option<&str>| AvalVerdict::Active {
+        let big = |_: &str, _: Option<&str>| GreentopoVerdict::Active {
             adr: "ADR-0001".into(),
             choice: None,
             reason: None,
@@ -2061,6 +2067,82 @@ mod tests {
         assert_eq!(parsed.env_protection, "scrub");
     }
 
+    /// A manifest written before greentopo's rename (relais 0.93.0 and older)
+    /// still parses. Its old names are history, read as unknown, never by
+    /// alias: no greentopo version, and a gap cause it does not know.
+    #[test]
+    fn a_manifest_written_under_the_old_names_still_parses_as_unknown() {
+        let mut stored = serde_json::to_value(manifest()).expect("json");
+        let tools = stored["tool_versions"].as_object_mut().expect("tools");
+        tools.remove("greentopo");
+        tools.insert("aval".into(), serde_json::json!("1.12.0"));
+        let guidance = stored["guidance"].as_object_mut().expect("guidance");
+        guidance.remove("greentopo_version");
+        guidance.insert("aval_version".into(), serde_json::json!("1.12.0"));
+        guidance.insert(
+            "gaps".into(),
+            serde_json::json!([
+                {"source": "code_rules", "cause": "aval_too_old", "detail": "old"},
+                {"source": "code_rules", "cause": "unknown_x", "detail": "newer"},
+            ]),
+        );
+        let parsed: ContextManifest = serde_json::from_value(stored).expect("still parses");
+        assert_eq!(parsed.tool_versions.greentopo, None);
+        assert_eq!(parsed.guidance.greentopo_version, None);
+        let causes: Vec<_> = parsed
+            .guidance
+            .gaps
+            .iter()
+            .map(|g| g.cause.clone())
+            .collect();
+        assert_eq!(
+            causes,
+            [guidance::GapCause::Unknown, guidance::GapCause::Unknown]
+        );
+    }
+
+    /// A new manifest writes only the new names, and the causes that carry
+    /// data keep their shape beside the catch-all.
+    #[test]
+    fn a_new_manifest_writes_the_greentopo_names() {
+        let mut m = manifest();
+        m.tool_versions.greentopo = Some("3.0.0".into());
+        m.guidance.greentopo_version = Some("3.0.0".into());
+        m.guidance.gaps = vec![
+            guidance::GuidanceGap::new(
+                guidance::GuidanceSource::CodeRules,
+                guidance::GapCause::GreentopoTooOld,
+                "old",
+            ),
+            guidance::GuidanceGap::new(
+                guidance::GuidanceSource::CodeRules,
+                guidance::GapCause::Exited(3),
+                "exit",
+            ),
+            guidance::GuidanceGap::new(
+                guidance::GuidanceSource::CodeRules,
+                guidance::GapCause::OverBudget {
+                    measured: 9,
+                    budget: 4,
+                },
+                "big",
+            ),
+        ];
+        let json = serde_json::to_value(&m).expect("json");
+        assert_eq!(json["tool_versions"]["greentopo"], "3.0.0");
+        assert_eq!(json["guidance"]["greentopo_version"], "3.0.0");
+        let gaps = &json["guidance"]["gaps"];
+        assert_eq!(gaps[0]["cause"], "greentopo_too_old");
+        assert_eq!(gaps[1]["cause"], serde_json::json!({"exited": 3}));
+        assert_eq!(
+            gaps[2]["cause"],
+            serde_json::json!({"over_budget": {"measured": 9, "budget": 4}})
+        );
+        assert!(!json.to_string().contains("aval"), "{json}");
+        let back: ContextManifest = serde_json::from_value(json).expect("round trip");
+        assert_eq!(back.guidance.gaps, m.guidance.gaps);
+    }
+
     /// V15: a read hint that resolves to nothing used to contribute no
     /// rows and no word about it, so the worker was pointed at a path
     /// the base revision does not have and nothing said so.
@@ -2142,7 +2224,7 @@ mod tests {
     }
 
     impl DecisionResolver for Guided {
-        fn resolve(&self, key: &str, scope: Option<&str>) -> AvalVerdict {
+        fn resolve(&self, key: &str, scope: Option<&str>) -> GreentopoVerdict {
             active(key, scope)
         }
 
@@ -2198,7 +2280,7 @@ mod tests {
         let g = &manifest.guidance;
         assert_eq!(g.index, ["errors.never-swallowed", "errors.typed-values"]);
         assert_eq!(g.rules.len(), 2);
-        assert_eq!(g.aval_version.as_deref(), Some("1.3.2"));
+        assert_eq!(g.greentopo_version.as_deref(), Some("1.3.2"));
         assert_eq!(g.relevant_keys.len(), 2, "the undecided key is recorded");
         assert_eq!(
             g.relevant_entries(&[]).len(),
@@ -2259,8 +2341,8 @@ mod tests {
     }
 
     #[test]
-    fn an_old_aval_fallback_keeps_every_id_in_the_index() {
-        assert_fallback_keeps_every_id_and_names_the_fix(guidance::GapCause::AvalTooOld);
+    fn an_old_greentopo_fallback_keeps_every_id_in_the_index() {
+        assert_fallback_keeps_every_id_and_names_the_fix(guidance::GapCause::GreentopoTooOld);
     }
 
     #[test]
@@ -2321,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn an_aval_that_will_not_launch_is_one_gap() {
+    fn a_greentopo_that_will_not_launch_is_one_gap() {
         let c = contract(&[]);
         let r = repo();
         let absent = Guided {

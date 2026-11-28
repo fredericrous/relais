@@ -395,7 +395,7 @@ impl RuleKind {
 }
 
 /// The full text of the `governs: code` rules for the worker, whole rules in
-/// the order aval listed them under `budget`, and the gap naming what did
+/// the order greentopo listed them under `budget`, and the gap naming what did
 /// not fit, or that the text is not available (a manifest read back from
 /// disk keeps ids and hashes only), and the ids of the rules shown in full.
 /// Nothing when there are no code rules.
@@ -439,7 +439,7 @@ pub(super) fn worker_code_rules_block(
         text.push_str("the code rules below are in force, in full; review blocks on them.\n");
         text.push_str(&data_block("code rules in force", &texts.join("\n\n")));
     }
-    let instruction = aval_rule_instruction(guidance, "before you write code it governs");
+    let instruction = greentopo_rule_instruction(guidance, "before you write code it governs");
     text.push_str(&tool_checked_block(&indexed, &instruction));
     let shown_ids = shown.iter().map(|rule| rule.id.clone()).collect();
     (text, gap, shown_ids)
@@ -494,7 +494,7 @@ pub(in crate::runner) fn tool_checked_block(lines: &[String], instruction: &str)
 
 /// How an agent reads one rule's full text: the `greentopo_rule` tool with the
 /// repository's corpus named, else the CLI. `purpose` ends the sentence.
-pub(in crate::runner) fn aval_rule_instruction(guidance: &Guidance, purpose: &str) -> String {
+pub(in crate::runner) fn greentopo_rule_instruction(guidance: &Guidance, purpose: &str) -> String {
     match &guidance.repo_name {
         Some(name) => format!(
             "read one rule with the `greentopo_rule` tool, passing `repo: \"{name}\"`, or run `greentopo rule <id>` in the working directory when that tool is not available or answers with an error, {purpose}."
@@ -505,13 +505,13 @@ pub(in crate::runner) fn aval_rule_instruction(guidance: &Guidance, purpose: &st
 
 /// The worker's constraint index: full ids grouped by prefix, and the
 /// instruction to fetch one rule's text. The instruction exists only with
-/// the index it refers to. Nothing when aval gave no index.
+/// the index it refers to. Nothing when greentopo gave no index.
 pub(super) fn constraint_index_block(guidance: &Guidance) -> String {
     let lines = guidance.index_lines();
     if lines.is_empty() {
         return String::new();
     }
-    let instruction = aval_rule_instruction(guidance, "before you write code it governs");
+    let instruction = greentopo_rule_instruction(guidance, "before you write code it governs");
     format!(
         "the constraint rules below are in force; review blocks on them.\n{instruction}\n{}",
         data_block("constraint index", &lines.join("\n"))
@@ -561,7 +561,7 @@ pub(super) fn fence_safe(text: &str) -> String {
         .join("\n")
 }
 
-/// The decisions and rules aval ranked as relevant, in full. Advisory:
+/// The decisions and rules greentopo ranked as relevant, in full. Advisory:
 /// only active decisions are listed. `skip_rules` leaves out rules the
 /// prompt already shows in full. Nothing when there is nothing to list.
 pub(crate) fn relevant_block(guidance: &Guidance, skip_rules: &[&str]) -> String {

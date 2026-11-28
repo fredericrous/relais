@@ -8,6 +8,17 @@ missing here.
 
 ## Unreleased
 
+relais names greentopo in its own code and in the names it stores
+(programme topo-spotter-rename t28). A run whose greentopo fails now ends
+`blocked (greentopo_tool_failure)`; it was `aval_tool_failure`. The context
+manifest writes `tool_versions.greentopo` (was `tool_versions.aval`),
+`guidance.greentopo_version` (was `guidance.aval_version`) and the gap cause
+`greentopo_too_old` (was `aval_too_old`). Records written before keep their old
+strings: a ledger row still reads back with `aval_tool_failure`, and an old
+manifest still parses, with no greentopo version and its old gap cause read as
+`unknown`. No alias reads the old names. The internal `AvalCli`, `AvalVerdict`,
+`run_aval` and the other `aval_*` names are now `Greentopo*`/`greentopo_*`.
+
 ## v0.94.0
 
 relais reads the host slot held marker through the slots crate's one reader

@@ -369,7 +369,7 @@ fn run_to_the_end(fill: &Fill, run_id: Option<RunId>) -> Result<RunOutcome, RunE
     let machine = fixture.machine_for(&repo);
     let contract = fixture.contract(Review::Off);
     let backend = conditional_worker("relais task");
-    let resolver = |_: &str, _: Option<&str>| AvalVerdict::Active {
+    let resolver = |_: &str, _: Option<&str>| GreentopoVerdict::Active {
         adr: "ADR-0001".into(),
         choice: None,
         reason: None,
@@ -388,7 +388,7 @@ fn run_to_the_end(fill: &Fill, run_id: Option<RunId>) -> Result<RunOutcome, RunE
         hooks: &crate::verify::FixedInventory(None),
         attest: &crate::verify::FixedAttest::default(),
         artifacts_dir: fixture.artifacts.clone(),
-        aval_resolver: &resolver,
+        greentopo_resolver: &resolver,
         predictor: None,
         gate: None,
         session_id: "test-session".into(),

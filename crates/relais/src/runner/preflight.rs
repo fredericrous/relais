@@ -845,14 +845,14 @@ impl<'a> RunEngine<'a> {
             fingerprints,
             tool_versions: context::ToolVersions {
                 relais: crate::version().to_string(),
-                aval: crate::tooling::program_version_text(&self.greentopo_program()),
+                greentopo: crate::tooling::program_version_text(&self.greentopo_program()),
                 amont: crate::tooling::integration_version("amont"),
                 claude_code: capabilities.and_then(|capabilities| capabilities.version.clone()),
             },
             // Recorded so a receipt says whether a turn ceiling was
             // enforceable at all on this harness (SPEC §11).
             turn_ceiling,
-            resolver: self.config.aval_resolver,
+            resolver: self.config.greentopo_resolver,
             design,
             repo_name: crate::repo::main_checkout_name(self.config.repo_dir),
             holdouts: holdouts.iter().map(|holdout| holdout.record()).collect(),
@@ -900,9 +900,12 @@ impl<'a> RunEngine<'a> {
                     },
                 )?))
             }
-            Err(ContextError::ToolFailure { key, detail }) => Ok(Phase::Ended(
-                self.fail_preflight(BlockCode::AvalToolFailure, format!("`{key}`: {detail}"))?,
-            )),
+            Err(ContextError::ToolFailure { key, detail }) => {
+                Ok(Phase::Ended(self.fail_preflight(
+                    BlockCode::GreentopoToolFailure,
+                    format!("`{key}`: {detail}"),
+                )?))
+            }
             Err(ContextError::SizingProblem { .. }) => Ok(Phase::Ended(self.fail_preflight(
                 BlockCode::ContextSizing,
                 "required context exceeds the budget".to_string(),
