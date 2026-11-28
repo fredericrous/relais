@@ -57,7 +57,7 @@ Done in two pull requests, with the plan
   heartbeat, budget, cancel, announce and its sleeper. A lock that fails
   before the line is joined still turns the host slots off once, and the
   command runs unqueued. `procs::load_average` and its two platform arms are
-  gone; their three callers read `greenharness_slots::load1`.
+  gone; their two callers (three call sites) read `greenharness_slots::load1`.
 - **Lines removed, measured** (`git diff --numstat origin/main`):
   - `procs.rs`: −20.
   - `verify/heavy.rs`: +108/−100. The 80-line copy of the loop is gone, but
@@ -67,6 +67,9 @@ Done in two pull requests, with the plan
     while queued; a lock that fails before joining). That is under the plan's
     20-line bar, so this reads as "one loop, little code saved". The gain is
     the single loop of ADR-0022, not size.
+- **`Line(Ceiling)`**, which relais's `Duration::MAX` ceiling never reaches,
+  maps to a new `SlotLineEnd::Ceiling`, so its event and its journal row both
+  say "ceiling".
 - **Tests:** `verify::heavy` passes 59 of 59 against the published crate,
   with the existing slot-wait tests unedited. The cancel test asserts one
   heartbeat per pause, and that the cancelled waiter leaves the line.

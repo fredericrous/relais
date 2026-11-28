@@ -433,6 +433,9 @@ pub enum SlotLineEnd {
     Stalled { window_s: u64, position: usize },
     /// The queue was joined, then its lock failed `failures` polls in a row.
     Unreadable { failures: u32, cause: String },
+    /// The line's hard ceiling ran out after `waited_s`: never under relais's
+    /// `Duration::MAX`, kept so the crate's every end has a name here.
+    Ceiling { waited_s: u64 },
 }
 
 impl std::fmt::Display for SlotLineEnd {
@@ -446,6 +449,12 @@ impl std::fmt::Display for SlotLineEnd {
                 f,
                 "the host slot line could not be read {failures} times in a row: {cause}"
             ),
+            Self::Ceiling { waited_s } => {
+                write!(
+                    f,
+                    "the host slot line reached its ceiling after {waited_s} s"
+                )
+            }
         }
     }
 }
@@ -1552,13 +1561,11 @@ mod slots {
                 },
                 WaitEnd::Stalled,
             ),
-            // Never reached under `Duration::MAX`: a line that stopped where
-            // it was, never a panic.
-            Err(Ended::Line(LineEnd::Ceiling { .. })) => (
+            // Never reached under `Duration::MAX`; named, never a panic.
+            Err(Ended::Line(LineEnd::Ceiling { waited })) => (
                 "admission_queue_ended",
-                SlotLineEnd::Stalled {
-                    window_s: admission.stall_window.as_secs(),
-                    position: joined_at.unwrap_or_default(),
+                SlotLineEnd::Ceiling {
+                    waited_s: waited.as_secs(),
                 },
                 WaitEnd::Ceiling,
             ),

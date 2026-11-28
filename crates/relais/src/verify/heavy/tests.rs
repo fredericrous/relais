@@ -1592,6 +1592,7 @@ mod host_slots {
         let dir = temp_dir("slots-prejoin");
         let slots_dir = slot_dir("prejoin");
         // `admission` as a directory: the ticket is made, the lock cannot be.
+        // Relies on the crate's lock file name (greenharness-slots `poll_with`).
         std::fs::create_dir(slots_dir.join("admission")).expect("admission dir");
         let gate = Recording::new(gate_with(1));
         register(&gate.inner, "run-pj");
