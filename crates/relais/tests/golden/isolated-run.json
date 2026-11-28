@@ -32,6 +32,10 @@
         "name": "worktree · setup"
       },
       {
+        "kind": "environment_warning",
+        "what": "host_slots_off"
+      },
+      {
         "kind": "check_started",
         "label": "setup:sh@0500b2cc"
       },
@@ -315,6 +319,10 @@
       {
         "kind": "step",
         "name": "worktree · setup"
+      },
+      {
+        "kind": "environment_warning",
+        "what": "host_slots_off"
       },
       {
         "kind": "check_started",

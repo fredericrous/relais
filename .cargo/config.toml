@@ -2,9 +2,12 @@
 # CI. Since relais joins amont's host slot queue by default (amont ADR-0014),
 # a test that builds a runner with default settings would queue on the REAL
 # host slots: behind the very suite running it locally, and behind its
-# sibling tests on CI, one per 60 s ramp. `GREENHARNESS_HOST_SLOT=held` says an
-# ancestor holds the slots, so nothing queues. The slot tests set their own
-# directory and ancestor flag, and still exercise the queue. A check whose
+# sibling tests on CI, one per 60 s ramp. `GREENGATE_HOST_SLOTS=0` turns the
+# host queue off, so nothing queues; the held marker is forced empty beside
+# it, so a real holder's `held:<lease>` never reaches a test, and a bare
+# `held` is no longer the escape (amont's reader refuses it once the
+# held-marker rollout ends, host-slot-admission t15). The slot tests set their
+# own directory and ancestor flag, and still exercise the queue. A check whose
 # runner holds slots gets the variable from the admission alone (the spawn
 # removes an inherited one), so `slot=held` in those tests stays meaningful.
 #
@@ -14,4 +17,5 @@
 # `cargo_pins_the_host_slot_for_tests` in verify/heavy/tests.rs fails if this
 # file stops reaching the tests.
 [env]
-GREENHARNESS_HOST_SLOT = "held"
+GREENHARNESS_HOST_SLOT = { value = "", force = true }
+GREENGATE_HOST_SLOTS = { value = "0", force = true }

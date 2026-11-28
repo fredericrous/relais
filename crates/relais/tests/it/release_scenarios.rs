@@ -4627,7 +4627,12 @@ fn outcome_after_session_line(stderr: &str) -> &str {
         first.starts_with("session: "),
         "the first stderr line names the session: {stderr}"
     );
-    rest
+    // The suite runs with host slots off (`.cargo/config.toml`, amont
+    // host-slot-admission t15), which a run says once before its outcome.
+    match rest.split_once('\n') {
+        Some((line, after)) if line.starts_with("relais: host_slots_off:") => after,
+        _ => rest,
+    }
 }
 
 // ---------------------------------------------------------------------

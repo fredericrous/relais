@@ -1111,6 +1111,7 @@ fn ended_on(fixture: &Fixture, exhausted: Exhausted) -> RunOutcome {
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
         node_host: Some("test-node".into()),
+        host_marker: &crate::verify::HostMarker::absent(),
     };
     let mut engine = RunEngine::new(&config, None).expect("engine");
     fixture

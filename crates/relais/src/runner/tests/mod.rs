@@ -344,6 +344,7 @@ impl Fixture {
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
             node_host: Some("test-node".into()),
+            host_marker: &crate::verify::HostMarker::absent(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -404,6 +405,7 @@ impl Fixture {
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
             node_host: Some("test-node".into()),
+            host_marker: &crate::verify::HostMarker::absent(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -446,6 +448,7 @@ impl Fixture {
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
             node_host: Some("test-node".into()),
+            host_marker: &crate::verify::HostMarker::absent(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -487,6 +490,7 @@ impl Fixture {
             declarations: &crate::trust::NoHistory,
             shared_state: &crate::shared_state::LocalState::new(),
             node_host: Some("test-node".into()),
+            host_marker: &crate::verify::HostMarker::absent(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -576,6 +580,7 @@ impl Fixture {
             declarations: &crate::trust::NoHistory,
             shared_state,
             node_host: Some("test-node".into()),
+            host_marker: &crate::verify::HostMarker::absent(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -624,6 +629,7 @@ impl Fixture {
             declarations,
             shared_state: &crate::shared_state::LocalState::new(),
             node_host: Some("test-node".into()),
+            host_marker: &crate::verify::HostMarker::absent(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -716,6 +722,7 @@ impl Fixture {
             declarations: &crate::trust::NoHistory,
             shared_state: state,
             node_host: Some("test-node".into()),
+            host_marker: &crate::verify::HostMarker::absent(),
         })
         .expect("the fixture's id source mints identifiers")
     }
@@ -1060,6 +1067,7 @@ fn a_driver_whose_run_was_ended_elsewhere_stops_without_writing() {
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
         node_host: Some("test-node".into()),
+        host_marker: &crate::verify::HostMarker::absent(),
     };
     let mut engine = RunEngine::new(&config, None).expect("engine");
     let run_id = engine.run_id.clone();
@@ -2248,6 +2256,7 @@ fn an_unreadable_working_tree_blocks_like_a_dirty_one() {
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
         node_host: Some("test-node".into()),
+        host_marker: &crate::verify::HostMarker::absent(),
     })
     .expect("the fixture's id source mints identifiers");
     let RunOutcome {
@@ -8208,6 +8217,7 @@ fn guidance_note_is_empty_without_a_gap_and_names_a_manifest_gap_or_a_reviewer_g
         declarations: &crate::trust::NoHistory,
         shared_state: &crate::shared_state::LocalState::new(),
         node_host: Some("test-node".into()),
+        host_marker: &crate::verify::HostMarker::absent(),
     };
     let mut engine = RunEngine::new(&config, None).expect("engine");
     let clean = manifest_with(Vec::new());

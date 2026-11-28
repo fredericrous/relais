@@ -61,8 +61,9 @@ amont-quiet = "1.60"
 # implementation, so relais links it instead of carrying a copy. What it
 # pulls: one std-only crate, no dependencies and no build script, released
 # with greengate (4.13.0: the journal's holders and release lines, which
-# relais's tests read). If greengate stopped publishing it, relais would pin
-# the last version: the queue is a small directory protocol, vendorable.
+# relais's tests read; 5.4: the held-marker reader, amont t15; 5.5: the paced
+# wait). If greengate stopped publishing it, relais would pin the last
+# version: the queue is a small directory protocol, vendorable.
 greenharness-slots = "5.5"
 
 # Process facts and signals live in `procs`; the endpoint in `ipc`. Each

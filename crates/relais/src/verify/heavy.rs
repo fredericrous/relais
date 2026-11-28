@@ -15,9 +15,11 @@
 //!    alone); a directory the crate refuses is said once as
 //!    `host_slots_off`. The runner holds the slots, never the check: their
 //!    descriptors are close-on-exec, so a daemon a check leaves behind does
-//!    not keep one. Where an ancestor already holds slots
-//!    (`GREENHARNESS_HOST_SLOT=held` in relais's own environment) nothing is
-//!    queued for, and the variable is passed on;
+//!    not keep one. Where an ancestor already holds slots (relais's own
+//!    `GREENHARNESS_HOST_SLOT` is a marker the slots crate's reader accepts:
+//!    a live `held:<lease>`, or the bare `held` during the rollout) nothing
+//!    is queued for, and the checks get the bare `held` (the lease's own
+//!    marker from amont host-slot-admission t15's phase 2);
 //! 3. the child's environment: the parallelism bounds below, then the
 //!    check's own `env`;
 //! 4. once the process group exists, its id goes to the coordinator, which
@@ -41,7 +43,7 @@
 //! amount of memory.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,11 +92,66 @@ pub const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// spent retrying), so the run stays visibly alive.
 pub const COORDINATOR_UNREACHABLE_CLASS: &str = "coordinator_unreachable";
 
-/// Whether relais's own environment says an ancestor already holds host
-/// slots for this process tree (`GREENHARNESS_HOST_SLOT=held`, amont ADR-0009).
-/// Read at the boundary (the runner), passed in as a fact.
-pub fn ancestor_holds_slots(value: Option<&str>) -> bool {
-    value == Some("held")
+/// relais's own held marker, judged once at the composition root (the CLI
+/// reads it before `execute`) by the slots crate's one reader, with the log
+/// that says a refusal once: every admission of one run, and of the child
+/// runs it hosts, gets the same answer (amont host-slot-admission t15).
+pub struct HostMarker {
+    marker: greenharness_slots::Marker,
+    log: greenharness_slots::MarkerLog,
+}
+
+impl HostMarker {
+    /// This process's `GREENHARNESS_HOST_SLOT`, judged now.
+    pub fn read() -> HostMarker {
+        HostMarker::given(greenharness_slots::held_marker())
+    }
+
+    /// A marker already judged, with a fresh log: the seam tests use.
+    pub fn given(marker: greenharness_slots::Marker) -> HostMarker {
+        HostMarker {
+            marker,
+            log: greenharness_slots::MarkerLog::new(),
+        }
+    }
+
+    /// No marker: nothing held above this run.
+    pub fn absent() -> HostMarker {
+        HostMarker::given(greenharness_slots::Marker::Absent)
+    }
+
+    /// [`ancestor_holds_slots`] for this marker and its log.
+    pub fn judge(&self, queues: Option<&Path>) -> (bool, Option<String>) {
+        ancestor_holds_slots(&self.marker, queues, &self.log)
+    }
+}
+
+/// Whether an ancestor already holds host slots for this process tree, and
+/// the line to say when it does not: `marker` is relais's own
+/// `GREENHARNESS_HOST_SLOT` as the slots crate's one reader judged it (amont
+/// ADR-0022, amended for t15; the bare `held` is accepted during the
+/// rollout), and `log` the run's ([`HostMarker`]); the runner prints the
+/// line. `queues` is the slot directory this run would
+/// queue on, when the host queue is on there: a refused marker is then
+/// journalled there once per log, and its line returned once. A held marker
+/// never returns a line: the crate has none for an accepted marker.
+// holds-until: no machine sets `shared_host_slots`. The row goes to the
+// run's queue directory while the lease is judged against the slots crate's
+// own directory; the two differ only under that setting, and the phase-3
+// count reads the default one (amont plan, phase 3 gate).
+pub fn ancestor_holds_slots(
+    marker: &greenharness_slots::Marker,
+    queues: Option<&Path>,
+    log: &greenharness_slots::MarkerLog,
+) -> (bool, Option<String>) {
+    // `record` appends the journal row: an action, so a match, not a filter.
+    let said = match queues {
+        Some(dir) if log.record(dir, "relais", marker) => {
+            greenharness_slots::refused_line("relais", marker)
+        }
+        _ => None,
+    };
+    (marker.is_held(), said)
 }
 
 /// Waiting, made injectable: a queue sleeps through this, so a test that

@@ -556,6 +556,7 @@ pub(crate) fn run_command(
         declarations: &relais::trust::Recorder(&ledger),
         shared_state: &*shared,
         node_host: relais::procs::host_name(),
+        host_marker: &relais::verify::HostMarker::read(),
     }) {
         Ok(outcome) => outcome,
         Err(e) => {

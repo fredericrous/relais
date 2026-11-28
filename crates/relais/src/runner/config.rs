@@ -85,6 +85,10 @@ pub struct RunConfig<'a> {
     /// (an-t24). Read once at the CLI's composition root; `None` when the OS
     /// gives none.
     pub node_host: Option<String>,
+    /// relais's own held marker and the log that says its refusal once,
+    /// judged once at the CLI's composition root; a child run uses its
+    /// parent's (amont host-slot-admission t15).
+    pub host_marker: &'a verify::HostMarker,
 }
 
 /// Where a run's program design comes from: the path its contract names,
