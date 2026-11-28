@@ -47,7 +47,7 @@ pub use heavy::{
     host_plan, host_share, logical_cores, overweight, parallelism, Admitted, Ask, HeavyAdmission,
     HostMarker, HostPlan, HostSlots, HostSlotsOff, Jitter, Judged, KeptSlot, LeaseStop, Placement,
     SeededJitter, SetupSlot, Sleeper, SlotLineEnd, ThreadSleeper, Tries, ANNOUNCE_EVERY,
-    HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY,
+    HOST_SLOT_ENV, LEASE_HEARTBEAT_EVERY, UNATTRIBUTED_SESSION_PREFIX,
 };
 pub use holdout_run::{HoldoutAttempt, HoldoutRun, HoldoutTest, HoldoutVerdict};
 pub use junit::{parse_junit, parse_report, JunitArtifact, JunitError, JunitReport, TestOutcome};

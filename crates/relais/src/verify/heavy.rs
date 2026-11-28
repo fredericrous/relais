@@ -606,11 +606,19 @@ impl Tries {
     }
 }
 
+/// The start of the session id `coordinator::resolve_session` makes up
+/// when neither `RELAIS_SESSION_ID` nor `CLAUDE_CODE_SESSION_ID` is set: a
+/// stand-in, never a caller's identity (amont host-slot-admission t24).
+pub const UNATTRIBUTED_SESSION_PREFIX: &str = "unattributed-";
+
 /// Admits the commands of one run.
 pub struct HeavyAdmission<'a> {
     /// `None`: no coordinator, nothing is admitted (as for model work).
     pub gate: Option<&'a (dyn Gate + Sync)>,
     pub run_id: String,
+    /// The session that dispatched the run; empty when none is known (tests,
+    /// unmanaged paths). Empty or [`UNATTRIBUTED_SESSION_PREFIX`]: the host
+    /// slot holder is named by the run id instead.
     pub session_id: String,
     pub budgets: Budgets,
     pub events: Events,
@@ -1508,13 +1516,24 @@ mod slots {
         Ok(Some(dir.to_path_buf()))
     }
 
-    /// The holder record of a relais command: its label, under the run.
+    /// The holder record of a relais command: its label, under the session
+    /// that dispatched the run, so that session may move it ahead with
+    /// `greengate slot promote` (amont host-slot-admission t06, t24). With
+    /// no session, or only the `unattributed-` stand-in, the run id names
+    /// it: no caller is either, and the run id tells such rows apart where
+    /// an 8-character `unattrib` would not.
     pub(super) fn holder(
         admission: &HeavyAdmission<'_>,
         label: &str,
     ) -> greenharness_slots::Holder {
         let mut holder = greenharness_slots::Holder::here("relais", label);
-        holder.session = admission.run_id.clone();
+        let session = &admission.session_id;
+        holder.session =
+            if session.is_empty() || session.starts_with(super::UNATTRIBUTED_SESSION_PREFIX) {
+                admission.run_id.clone()
+            } else {
+                session.clone()
+            };
         holder
     }
 
