@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.96.0
+
 relais now exports `GREENHARNESS_HOST_SLOT=held:<lease>`, the id of the host
 slot lease a command runs under, instead of the bare `held` (amont
 host-slot-admission t15, phase 2): a setup's later steps carry the kept
