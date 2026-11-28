@@ -248,4 +248,11 @@ Surprise: the copy was mostly end mapping, not loop, so the line saving is
 small; and a fleet-pack refresh made with the Mac's greentopo fails CI's
 pinned one.
 
+## Implementation review
+
+- implementation-review: approve after 2 deltas (round 1 approve-with-changes: plan results, caller count, pack refresh named; numstat and ceiling-event wording fixed); 59k+63k, 37+13 s.
+- backend: approve after 2 deltas (Ceiling variant added; heartbeat `Err` and pre-join row kept as today, deliberate: same as `origin/main`, filed f45); 55k+57k.
+- lang:rust: approve (fmt already clean on 1.94.1; lock-file-name comment added); 38k+41k, 15+14 s.
+- architect: approve (`SlotLineEnd::Ceiling` is the named value for `Line(Ceiling)`); 51k+55k, 25+15 s. All on opus; final tree eb62c0e18f4e.
+
 <!-- panel: repos=relais,amont adds=contract reviewers=backend,lang:rust,architect,po,tui,unix body-sha=965738b77130 -->
