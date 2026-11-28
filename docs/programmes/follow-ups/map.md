@@ -145,6 +145,13 @@ ticket here until it is resolved or moved into a programme of its own.
   path, a known writer (plugin refresh, git branch tracking), or nothing
   known. The warning lists unexplained drifts first and folds known-writer
   drifts into a count line (#637, v0.93.0).
+- [f08](f08-home-fingerprint-measure.md) (2026-11-20, closed 2026-11-28):
+  no rollback. The drift check adds about 6 ms before a command and
+  9 ms p50, 29 ms p95 after it; the whole hook's p95 is already 72 ms
+  where the check never runs. Warnings are too frequent to stand out:
+  relais warned on 7 of 16 runs, greenbelay 23 times in about 6 days. Nearly
+  all match the known writers f33 names. relais recounts with causes
+  (f47); greenbelay gets the same known writers (greenbelay t10).
 
 ## Handoff
 
@@ -160,8 +167,8 @@ to f27 are live.
 
 - Done: f12, f13, f14, f15, f17, f18, f19, f20, f21, f24, f25, f26, f27, f29, f30, f31, f32, f33.
 - Next:
-  - Count unexplained home drifts (f08), due 2026-11-28. Only rows from
-    v0.93.0 on carry a cause.
+  - Recount home drifts by cause over a week of v0.93.0 rows (f47), due
+    2026-12-05. f08 closed 2026-11-28.
   - Check the plugin's other `tool.call` `.catch` answers (f28), ready.
   - Name the directory aval cannot enter, since f32 catches only a
     missing one or a file (f34), ready.
