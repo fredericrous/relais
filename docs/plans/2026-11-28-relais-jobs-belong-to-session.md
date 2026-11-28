@@ -120,13 +120,13 @@ dispatched the run.
 - Phase 1: a unit test in `verify/heavy/tests.rs` holds the one slot with
   another holder, queues two other-session waiters, then admits a relais
   command (session `tab`). From inside the relais wait it promotes the relais
-  job (found in `queue_in` by tool `relais`) first as session `other`
+  job (found in `queue_in` by tool `relais`) first as session `session-other`
   → refused `own-session`; then as `tab` → `Moved { from: 2, to: 0 }` (a
   refusal's `limit()` is printed in the assertion message, so an `age-floor`
   on a slow host explains itself); then
-  releases the holder only on a later sleeper call, once events.jsonl
-  holds a `waiting_for_slot` with position 0 (the two other waiters are kept
-  alive under a tool other than `relais`, in a fresh slot dir) →
+  releases the holder three sleeper calls after the move lands, and reads
+  events.jsonl only after the grant (the two other waiters are kept alive
+  under a tool other than `relais`, in a fresh slot dir) →
   the relais command is granted while both other
   waiters still wait, and its `waiting_for_slot` events read position 2
   before the move and 0 after. The `released` row names `"session":"tab"`.
@@ -156,9 +156,9 @@ dispatched the run.
 
 ## Implementation review
 
-- implementation-review: approve-with-changes; fixed: plan Verification text, observed results, place-order assert, scratch dir; `session-other` naming kept (matches the test). 58k, 52 s.
-- backend: approve-with-changes; fixed: one prefix constant, promote errors recorded in the failure; PR body says why the session change needs no migration. 64k, 81 s.
-- lang:rust: approve-with-changes; fixed: prefix constant (verify side, no new module edge), doc line on `session_id`. 49k, 34 s.
-- tui: approve-with-changes; fixed: CHANGELOG names `$CLAUDE_CODE_SESSION_ID`, drops the stand-in jargon, says where the run id still lives. 43k, 27 s.
+- implementation-review: approve-with-changes, then Delta approve-with-changes (plan text only, fixed); fixed: Verification text, observed results, place-order assert, scratch dir. 58k + 70k.
+- backend: approve-with-changes, Delta approve; fixed: one prefix constant, promote errors recorded, no-migration reason in the PR body; deliberate: `resolve_session` doc name is right (the public wrapper exists). 64k + 72k.
+- lang:rust: approve-with-changes, Delta approve; fixed: prefix constant (verify side), `session_id` doc; deliberate: owned strings in the test table, a nit. 49k + 56k.
+- tui: approve-with-changes, Delta approve; fixed: CHANGELOG names `$CLAUDE_CODE_SESSION_ID`, plain wording, where the run id lives. 43k + 50k.
 
 <!-- panel: repos=relais,amont reviewers=backend,lang:rust,tui,unix body-sha=1adeb5ace647 -->
