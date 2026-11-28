@@ -606,11 +606,19 @@ impl Tries {
     }
 }
 
+/// The start of the session id `coordinator::resolve_session` makes up
+/// when neither `RELAIS_SESSION_ID` nor `CLAUDE_CODE_SESSION_ID` is set: a
+/// stand-in, never a caller's identity (amont host-slot-admission t24).
+pub const UNATTRIBUTED_SESSION_PREFIX: &str = "unattributed-";
+
 /// Admits the commands of one run.
 pub struct HeavyAdmission<'a> {
     /// `None`: no coordinator, nothing is admitted (as for model work).
     pub gate: Option<&'a (dyn Gate + Sync)>,
     pub run_id: String,
+    /// The session that dispatched the run; empty when none is known (tests,
+    /// unmanaged paths). Empty or [`UNATTRIBUTED_SESSION_PREFIX`]: the host
+    /// slot holder is named by the run id instead.
     pub session_id: String,
     pub budgets: Budgets,
     pub events: Events,
@@ -1520,11 +1528,12 @@ mod slots {
     ) -> greenharness_slots::Holder {
         let mut holder = greenharness_slots::Holder::here("relais", label);
         let session = &admission.session_id;
-        holder.session = if session.is_empty() || session.starts_with("unattributed-") {
-            admission.run_id.clone()
-        } else {
-            session.clone()
-        };
+        holder.session =
+            if session.is_empty() || session.starts_with(super::UNATTRIBUTED_SESSION_PREFIX) {
+                admission.run_id.clone()
+            } else {
+                session.clone()
+            };
         holder
     }
 

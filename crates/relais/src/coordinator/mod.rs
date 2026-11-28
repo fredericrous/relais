@@ -3007,8 +3007,11 @@ fn resolve_session_id(
         }
     }
     let id = match parent {
-        Some(parent) => format!("unattributed-ppid-{parent}"),
-        None => format!("unattributed-pid-{own}"),
+        Some(parent) => format!(
+            "{}ppid-{parent}",
+            crate::verify::UNATTRIBUTED_SESSION_PREFIX
+        ),
+        None => format!("{}pid-{own}", crate::verify::UNATTRIBUTED_SESSION_PREFIX),
     };
     ResolvedSessionId {
         id,

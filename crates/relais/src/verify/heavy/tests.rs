@@ -1491,12 +1491,12 @@ mod host_slots {
     fn a_holder_with_no_real_session_is_named_by_its_run() {
         let gate = gate_with(1);
         for (session, expected) in [
-            ("", "run-e"),
-            ("unattributed-ppid-7", "run-e"),
-            ("tab", "tab"),
+            (&String::new(), "run-e"),
+            (&format!("{UNATTRIBUTED_SESSION_PREFIX}ppid-7"), "run-e"),
+            (&"tab".to_string(), "tab"),
         ] {
             let mut shared = admission(&gate, "run-e", 1, 4);
-            shared.session_id = session.into();
+            shared.session_id = session.to_string();
             let holder = slots::holder(&shared, "cmd0");
             assert_eq!(holder.session, expected, "session {session:?}");
             assert_eq!(
@@ -1554,7 +1554,16 @@ mod host_slots {
         // ends an unmoved wait, so a move that never lands fails the asserts
         // below instead of hanging. (The events file is read only after the
         // grant: it is not flushed while the wait runs.)
-        type Tried = (Option<Refused>, Option<(greenharness_slots::Moved, usize)>);
+        // What each try answered: the other session's refusal, the owner's
+        // move and the wait it landed on, and the last answer that was
+        // neither (a busy lock, an `age-floor` on a slow host), so a move
+        // that never lands says why.
+        #[derive(Default, Clone)]
+        struct Tried {
+            refused: Option<Refused>,
+            moved: Option<(greenharness_slots::Moved, usize)>,
+            last_other: Option<String>,
+        }
         let tried = Arc::new(Mutex::new(Tried::default()));
         let noted = Arc::clone(&tried);
         let release = Arc::clone(&held);
@@ -1562,7 +1571,7 @@ mod host_slots {
         with_slots.stall_window = Duration::from_secs(5);
         with_slots.sleeper = Advancing::then(&clock, move |number| {
             let mut tried = noted.lock().expect("tried");
-            if tried.1.is_none() && number >= 3 {
+            if tried.moved.is_none() && number >= 3 {
                 let queue = greenharness_slots::queue_in(&queue_dir).unwrap_or_default();
                 let job = queue.iter().find(|j| {
                     matches!(j.state, JobState::Waiting { .. })
@@ -1576,53 +1585,40 @@ mod host_slots {
                         to: 0,
                         tool: "test",
                     };
-                    if tried.0.is_none() {
-                        if let Ok(Err(refused)) =
-                            greenharness_slots::promote_in(&queue_dir, &ask("session-other"))
-                        {
-                            tried.0 = Some(refused);
+                    if tried.refused.is_none() {
+                        match greenharness_slots::promote_in(&queue_dir, &ask("session-other")) {
+                            Ok(Err(refused)) => tried.refused = Some(refused),
+                            other => tried.last_other = Some(format!("other session: {other:?}")),
                         }
                     }
-                    if tried.0.is_some() {
-                        if let Ok(Ok(moved)) =
-                            greenharness_slots::promote_in(&queue_dir, &ask("tab"))
-                        {
-                            tried.1 = Some((moved, number));
+                    if tried.refused.is_some() {
+                        match greenharness_slots::promote_in(&queue_dir, &ask("tab")) {
+                            Ok(Ok(moved)) => tried.moved = Some((moved, number)),
+                            other => tried.last_other = Some(format!("owner: {other:?}")),
                         }
                     }
                 }
             }
-            if tried.1.as_ref().is_some_and(|(_, at)| number >= at + 3) || number >= 400 {
+            let moved_at = tried.moved.as_ref().map(|(_, at)| *at);
+            if moved_at.is_some_and(|at| number >= at + 3) || number >= 400 {
                 release.lock().expect("held").take();
             }
         });
-        let lease = with_slots
-            .admit(&ask(&BTreeMap::new(), 1))
-            .expect("the moved job is granted");
-        let (refused, moved) = tried.lock().expect("tried").clone();
-        let refused = refused.expect("a move from another session was answered");
-        assert_eq!(refused.limit(), "own-session", "{}", refused.describe());
-        let moved = moved.map(|(moved, _)| moved).unwrap_or_else(|| {
-            // Say why the owner's move did not land (an `age-floor` on a
-            // slow host, say), not only that it did not.
-            let why = greenharness_slots::queue_in(&slots_dir).ok().and_then(|q| {
-                let job = q
-                    .into_iter()
-                    .find(|j| j.holder.as_ref().is_some_and(|h| h.tool == "relais"))?;
-                let ask = Promote {
-                    id: &job.id,
-                    session: "tab",
-                    reason: "why",
-                    to: 0,
-                    tool: "test",
-                };
-                Some(format!(
-                    "{:?}",
-                    greenharness_slots::promote_in(&slots_dir, &ask)
-                ))
-            });
-            panic!("the dispatching session moved its job: {why:?}")
+        let granted = with_slots.admit(&ask(&BTreeMap::new(), 1));
+        let tried = tried.lock().expect("tried").clone();
+        let lease = granted.unwrap_or_else(|stop| {
+            panic!(
+                "the moved job is granted: {stop:?}; last other answer: {:?}",
+                tried.last_other
+            )
         });
+        let refused = tried
+            .refused
+            .unwrap_or_else(|| panic!("another session was refused: {:?}", tried.last_other));
+        assert_eq!(refused.limit(), "own-session", "{}", refused.describe());
+        let (moved, _) = tried
+            .moved
+            .unwrap_or_else(|| panic!("the owner moved its job: {:?}", tried.last_other));
         assert_eq!((moved.from, moved.to), (2, 0), "{moved:?}");
         // Granted ahead of both: the two other waiters still wait.
         let waiting: Vec<_> = greenharness_slots::queue_in(&slots_dir)
@@ -1643,6 +1639,10 @@ mod host_slots {
             .collect();
         assert_eq!(places.first(), Some(&2), "{written}");
         assert!(places.contains(&0), "{written}");
+        assert!(
+            places.iter().skip_while(|p| **p == 2).all(|p| *p == 0),
+            "2s, then only 0s: {written}"
+        );
         drop(lease);
         // The release row names the dispatching session, not the run.
         let journal = std::fs::read_to_string(slots_dir.join("waits.jsonl")).expect("journal");
@@ -1653,6 +1653,7 @@ mod host_slots {
         assert!(released.contains("\"session\":\"tab\""), "{released}");
         drop((first, second));
         std::fs::remove_dir_all(&slots_dir).ok(); // best-effort: a scratch dir
+        std::fs::remove_dir_all(&dir).ok(); // best-effort: a scratch dir
     }
 
     /// ADR-0015: a host-slot line that is still moving outlives

@@ -9,14 +9,16 @@ missing here.
 ## Unreleased
 
 A relais command waiting for a host slot now belongs to the Claude session
-that dispatched its run, not to the run (amont host-slot-admission t24), so
-that session can move it ahead with `greengate slot promote <id> --reason …`
-(greengate 5.2.0 or later), and no other session can. `greengate slots` and
-the `released` rows of `waits.jsonl` show that session for relais jobs where
-they showed the run id. A run with no session, or only the
-`unattributed-ppid-N` stand-in, keeps the run id and cannot be moved. Until
-relais prints a job's id, find it in `greengate slots` by the `relais`
-command and your session's first 8 characters.
+that dispatched its run, not to the run, so that session can move it ahead
+with `greengate slot promote <id> --reason …` (greengate 5.2.0 or later), and
+no other session can. To find the id, look in `greengate slots` for the
+`relais` row whose session starts with the first 8 characters of
+`$CLAUDE_CODE_SESSION_ID`. `greengate slots` and the `released` rows of
+`waits.jsonl` show that session for relais jobs where they showed the run id;
+no host-slot row carries the run id any more, and relais's own
+`events.jsonl` still ties each wait to its run. A run started outside a
+Claude session keeps the run id and cannot be moved. (amont
+host-slot-admission t24)
 
 ## v0.96.0
 
