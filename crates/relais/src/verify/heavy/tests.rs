@@ -2275,6 +2275,41 @@ mod setup_keeps_one_slot {
         .expect("waiter")
     }
 
+    /// Polls `waiter` until it is granted, for at most 5 s of real time.
+    ///
+    /// A released flock can stay held for a moment: another test thread
+    /// that forks a child (a `pre_exec` spawn takes std's fork path) while
+    /// this test holds the slot or admission fd gives the child a copy,
+    /// which keeps the lock until the child execs (close-on-exec). Under a
+    /// loaded parallel run that window was wide enough to fail one poll in
+    /// four. A lease that was never released still fails here: its holder
+    /// record stays in `holders/`, so the wait refuses at once.
+    fn granted_soon(waiter: &mut greenharness_slots::Waiter, slots: &Path) {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let polled = waiter.poll().expect("poll");
+            if matches!(polled, greenharness_slots::Poll::Granted(_)) {
+                return;
+            }
+            let records: Vec<String> = std::fs::read_dir(slots.join("holders"))
+                .map(|r| {
+                    r.filter_map(Result::ok)
+                        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                records.is_empty(),
+                "the slot is still recorded as held: {records:?}, {polled:?}"
+            );
+            assert!(
+                std::time::Instant::now() < until,
+                "no grant within 5 s: {polled:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// relais's rows of `outcome` in the slot journal.
     fn rows(slots: &Path, outcome: &str) -> usize {
         let journal = std::fs::read_to_string(slots.join("waits.jsonl")).unwrap_or_default();
@@ -2427,10 +2462,7 @@ mod setup_keeps_one_slot {
         assert_eq!(rows(&slots, "released"), 1);
         // ...and gets the slot once the setup is over.
         let mut other = joins.other.take().expect("joined");
-        assert!(matches!(
-            other.poll().expect("poll"),
-            greenharness_slots::Poll::Granted(_)
-        ));
+        granted_soon(&mut other, &slots);
         for (n, outcome) in outcomes.iter().enumerate() {
             let marker = std::fs::read_to_string(work.join(format!("marker{n}"))).expect("marker");
             assert_eq!(marker, HELD_MARKER, "step {n} runs under the held marker");
