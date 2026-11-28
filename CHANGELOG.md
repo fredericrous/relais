@@ -8,6 +8,8 @@ missing here.
 
 ## Unreleased
 
+## v0.94.0
+
 relais reads the host slot held marker through the slots crate's one reader
 (`greenharness-slots` 5.4 and later; amont ADR-0022, amended; programme
 host-slot-admission t15). A run skips the host queue only when its
