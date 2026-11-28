@@ -45,10 +45,16 @@ refuses the bare `held`.
   `RunConfig::host_marker`; a child run uses its parent's. The refusal is
   also an `EnvironmentWarning` `host_marker_refused`, as `host_slots_off`
   is.
+- 2026-11-28: rebased again on origin/main `28a2f9b23` (relais v0.93.0,
+  #641's paced wait). The requirement floor is now main's `"5.5"`, which
+  carries 5.4's reader, and the lock is main's (5.5.0); the CHANGELOG entry
+  sits under `## Unreleased`. All Rust auto-merged; clippy `-p relais
+  --all-targets -D warnings` clean; all five reviewers approved the rebased
+  tree (`bffe16e1…`) as a delta.
 
 ## Implementation review
 
-- implementation-review: approve-with-changes, round 1 and two Deltas; fixed: log at the edge, then injected (`HostMarker`), suite counts recorded; deliberate: no runner test of the event (slots forced off suite-wide; phase 3 checks it), `given`'s doc (phase 2 tests it). 132k.
+- implementation-review: approve (rebase delta) after approve-with-changes in round 1 and two Deltas; fixed: log at the edge, then injected (`HostMarker`), suite counts recorded; deliberate: no runner test of the event (slots forced off suite-wide; phase 3 checks it), `given`'s doc (phase 2 tests it). 132k.
 - backend: approve (delta); runner-boundary test deliberate as above; docs and once-per-run CHANGELOG fixed. 91k.
 - lang:rust: approve (delta); `match` for the journal write; tuple invariant documented. 87k.
 - unix: approve (delta); refusal is also an event. 87k.
